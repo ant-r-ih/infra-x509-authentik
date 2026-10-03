@@ -1,0 +1,642 @@
+---
+# Ansible playbook: deploy Authentik stack on EKS
+# Prerequisites:
+#   - kubectl configured for the target cluster
+#   - helm installed
+#   - cluster is running (terraform apply done)
+#
+# Usage:
+#   ansible-playbook playbooks/deploy.yml -e "cluster_name=x509-authentik"
+
+- name: Deploy Authentik authentication stack
+  hosts: x509-authentik
+  connection: local
+  gather_facts: false
+
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    authentik_namespace: authentik
+    ingress_namespace: ingress-nginx
+    authentik_version: "2026.8.3"
+    cnpg_version: "1.24.0"
+    enrollment_enabled: true
+
+  tasks:
+    - name: Assert all required Terraform variables are present
+      assert:
+        that:
+          - cluster_name is defined
+          - aws_region is defined
+          - aws_profile is defined
+          - authentik_domain is defined
+          - authentik_secret_key is defined
+          - authentik_pg_password is defined
+          - authentik_bootstrap_password is defined
+          - authentik_bootstrap_email is defined
+          - authentik_api_token is defined
+          - alb_target_group_arn is defined
+          - albc_role_arn is defined
+          - vpc_id is defined
+        fail_msg: "Required Terraform output(s) missing — run 'terraform apply' first."
+
+    - name: Update kubeconfig
+      command: >
+        aws eks update-kubeconfig
+        --name {{ cluster_name }}
+        --region {{ aws_region }}
+        --profile {{ aws_profile }}
+
+    # ── Namespaces ──────────────────────────────────────────────────
+    - name: Create namespaces
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ item }}"
+      loop:
+        - "{{ authentik_namespace }}"
+        - "{{ ingress_namespace }}"
+
+    # ── StorageClass ────────────────────────────────────────────────
+    - name: Apply gp3 StorageClass
+      kubernetes.core.k8s:
+        state: present
+        src: "{{ playbook_dir }}/../../kubernetes/cnpg/storageclass.yaml"
+
+    # ── CloudNativePG Operator ──────────────────────────────────────
+    - name: Install CloudNativePG operator
+      kubernetes.core.k8s:
+        state: present
+        src: "https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-{{ cnpg_version.split('.')[0] }}.{{ cnpg_version.split('.')[1] }}/releases/cnpg-{{ cnpg_version }}.yaml"
+
+    - name: Wait for CloudNativePG webhook
+      command: >
+        kubectl wait deployment/cnpg-controller-manager
+        --for=condition=Available --timeout=120s -n cnpg-system
+      changed_when: false
+
+    # ── PostgreSQL credentials ──────────────────────────────────────
+    - name: Create PostgreSQL secret
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: authentik-pg-credentials
+            namespace: "{{ authentik_namespace }}"
+          type: kubernetes.io/basic-auth
+          stringData:
+            username: authentik
+            password: "{{ authentik_pg_password }}"
+      no_log: true
+
+    - name: Deploy CloudNativePG cluster
+      kubernetes.core.k8s:
+        state: present
+        src: "{{ playbook_dir }}/../../kubernetes/cnpg/cluster.yaml"
+
+    # ── AWS Load Balancer Controller ────────────────────────────────
+    # Terraform outputs are injected via cloud.terraform.terraform_provider inventory.
+    # Access as hostvars['localhost']['<output_name>'].
+    - name: Add eks-charts Helm repo
+      kubernetes.core.helm_repository:
+        name: eks
+        repo_url: https://aws.github.io/eks-charts
+
+    - name: Install AWS Load Balancer Controller
+      kubernetes.core.helm:
+        name: aws-load-balancer-controller
+        chart_ref: eks/aws-load-balancer-controller
+        release_namespace: kube-system
+        values:
+          clusterName: "{{ cluster_name }}"
+          region: "{{ aws_region }}"
+          vpcId: "{{ vpc_id }}"
+          serviceAccount:
+            create: true
+            name: aws-load-balancer-controller
+            annotations:
+              eks.amazonaws.com/role-arn: "{{ albc_role_arn }}"
+          replicaCount: 1
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+
+    - name: Wait for AWS Load Balancer Controller
+      command: >
+        kubectl wait deployment/aws-load-balancer-controller
+        --for=condition=Available --timeout=120s -n kube-system
+      changed_when: false
+
+    # ── nginx Ingress Controller ────────────────────────────────────
+    - name: Add ingress-nginx Helm repo
+      kubernetes.core.helm_repository:
+        name: ingress-nginx
+        repo_url: https://kubernetes.github.io/ingress-nginx
+
+    - name: Apply njs ConfigMaps
+      kubernetes.core.k8s:
+        state: present
+        src: "{{ playbook_dir }}/../../kubernetes/ingress/njs-cert-parse-configmap.yaml"
+
+    - name: Install nginx Ingress
+      kubernetes.core.helm:
+        name: ingress-nginx
+        chart_ref: ingress-nginx/ingress-nginx
+        release_namespace: "{{ ingress_namespace }}"
+        create_namespace: false
+        values_files:
+          - "{{ playbook_dir }}/../../kubernetes/ingress/nginx-values.yaml"
+
+    # ── Authentik ───────────────────────────────────────────────────
+    - name: Add Authentik Helm repo
+      kubernetes.core.helm_repository:
+        name: authentik
+        repo_url: https://charts.goauthentik.io
+
+    - name: Install Authentik
+      kubernetes.core.helm:
+        name: authentik
+        chart_ref: authentik/authentik
+        chart_version: "{{ authentik_version }}"
+        release_namespace: "{{ authentik_namespace }}"
+        create_namespace: false
+        values_files:
+          - "{{ playbook_dir }}/../../kubernetes/authentik/values.yaml"
+        values:
+          authentik:
+            secret_key:         "{{ authentik_secret_key }}"
+            bootstrap_password: "{{ authentik_bootstrap_password }}"
+            bootstrap_email:    "{{ authentik_bootstrap_email }}"
+            bootstrap_token:    "{{ authentik_api_token }}"
+            postgresql:
+              password: "{{ authentik_pg_password }}"
+            web:
+              base_url: "https://{{ authentik_domain }}"
+
+    - name: Wait for Authentik server
+      command: >
+        kubectl wait deployment/authentik-server
+        --for=condition=Available --timeout=300s -n {{ authentik_namespace }}
+      changed_when: false
+
+    # ── Apply Ingress ────────────────────────────────────────────────
+    - name: Wait for nginx Ingress controller to be ready
+      command: >
+        kubectl wait deployment/ingress-nginx-controller
+        --for=condition=Available --timeout=120s -n {{ ingress_namespace }}
+      changed_when: false
+
+    - name: Apply Authentik nginx Ingress
+      kubernetes.core.k8s:
+        state: present
+        src: "{{ playbook_dir }}/../../kubernetes/ingress/authentik-ingress.yaml"
+
+    - name: Bind ALB target group to authentik-server via TargetGroupBinding
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: elbv2.k8s.aws/v1beta1
+          kind: TargetGroupBinding
+          metadata:
+            name: authentik-server
+            namespace: "{{ authentik_namespace }}"
+          spec:
+            serviceRef:
+              name: authentik-server
+              port: 80
+            targetGroupARN: "{{ alb_target_group_arn }}"
+            targetType: ip
+
+    # ── Authentik Blueprints ────────────────────────────────────────
+    # The ConfigMap is mounted at /blueprints/mounted/cm-authentik-blueprints/
+    # The worker applies blueprints inline via Celery on startup — no subprocess, no OOM.
+    - name: Create authentik-blueprints ConfigMap
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: authentik-blueprints
+            namespace: "{{ authentik_namespace }}"
+          data:
+            onboarding-flow.yaml: "{{ lookup('file', playbook_dir + '/../../kubernetes/authentik/blueprints/onboarding-flow.yaml') }}"
+            credential-enrollment-flow.yaml: "{{ lookup('file', playbook_dir + '/../../kubernetes/authentik/blueprints/credential-enrollment-flow.yaml') }}"
+            radius-outpost.yaml: "{{ lookup('file', playbook_dir + '/../../kubernetes/authentik/blueprints/radius-outpost.yaml') }}"
+
+    - name: Restart authentik-worker to apply mounted blueprints
+      kubernetes.core.k8s:
+        api_version: apps/v1
+        kind: Deployment
+        name: authentik-worker
+        namespace: "{{ authentik_namespace }}"
+        definition:
+          spec:
+            template:
+              metadata:
+                annotations:
+                  kubectl.kubernetes.io/restartedAt: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+
+    - name: Wait for authentik-worker after restart
+      command: >
+        kubectl wait deployment/authentik-worker
+        --for=condition=Available --timeout=120s -n {{ authentik_namespace }}
+      changed_when: false
+
+    # ── REST API configuration (no kubectl exec shell — avoids OOM in worker pod) ──
+    # Authentik bootstrap_token is passed to Helm; worker creates it on startup.
+    # All API calls go through kubectl port-forward (bypasses ALB mTLS requirement).
+
+    - name: Kill any existing port-forward on port 19000
+      shell: pkill -f "kubectl port-forward.*19000" || true
+      changed_when: false
+      ignore_errors: true
+
+    - name: Start kubectl port-forward to Authentik server
+      command: kubectl port-forward -n {{ authentik_namespace }} svc/authentik-server 19000:80
+      async: 3600
+      poll: 0
+      register: pf_job
+
+    - name: Wait for port-forward to be ready
+      wait_for:
+        port: 19000
+        delay: 2
+        timeout: 30
+
+    - name: Set Authentik API base URL (via port-forward)
+      set_fact:
+        authentik_api_base: "http://localhost:19000"
+
+    - name: Wait for Authentik API to accept bootstrap token
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/core/users/me/"
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+        status_code: [200]
+      register: api_ready
+      retries: 6
+      delay: 10
+      until: api_ready.status == 200
+      changed_when: false
+
+    # ── Configure default brand domain (fixes "Base URL not configured" warning) ──
+    - name: Get default Authentik brand
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/core/brands/?default=true"
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+        status_code: [200]
+      register: default_brand
+      changed_when: false
+
+    - name: Set default brand domain
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/core/brands/{{ default_brand.json.results[0].brand_uuid }}/"
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+        body_format: json
+        body:
+          domain: "{{ authentik_domain }}"
+        status_code: [200]
+      when: >-
+        default_brand.json.pagination.count > 0 and
+        default_brand.json.results[0].domain != authentik_domain
+
+    - name: Wait for cert-onboarding flow to be applied by worker
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/flows/instances/?slug=cert-onboarding"
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+        status_code: [200]
+      register: onboarding_flow_check
+      retries: 18
+      delay: 10
+      until: onboarding_flow_check.json.pagination.count > 0
+      changed_when: false
+
+    # Remove legacy combined policy if it survived a previous deploy
+    - name: Find legacy cert-onboarding-parse-cert-policy
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/policies/expression/?name=cert-onboarding-parse-cert-policy"
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+      register: legacy_policy
+      changed_when: false
+
+    - name: Remove legacy cert-onboarding-parse-cert-policy
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/policies/expression/{{ legacy_policy.json.results[0].pk }}/"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+        status_code: [204]
+      when: legacy_policy.json.pagination.count > 0
+
+    # PolicyBindings cannot be created via blueprint (two-phase UUID mismatch).
+    # evaluate_on_plan=True is required so policies run during FlowPlanner.plan()
+    # and can write pending_user into the live FlowPlan context.
+    - name: Get cert-onboarding flow details
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/flows/instances/?slug=cert-onboarding"
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+      register: onboarding_flow
+      changed_when: false
+
+    - name: Get cert-onboarding FlowStageBinding at order 20
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/flows/bindings/?target={{ onboarding_flow.json.results[0].pk }}&order=20"
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+      register: fsb
+      changed_when: false
+
+    - name: Set evaluate_on_plan=True on FlowStageBinding
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/flows/bindings/{{ fsb.json.results[0].pk }}/"
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+        body_format: json
+        body:
+          evaluate_on_plan: true
+        status_code: [200]
+
+    - name: Get cert-onboarding-lookup-policy
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/policies/expression/?name=cert-onboarding-lookup-policy"
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+      register: lookup_policy
+      changed_when: false
+
+    - name: Check if lookup PolicyBinding already exists
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/policies/bindings/?policy={{ lookup_policy.json.results[0].pk }}&order=0"
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+      register: lookup_binding_check
+      changed_when: false
+
+    - name: Create lookup PolicyBinding (order 0, always enabled)
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/policies/bindings/"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+        body_format: json
+        body:
+          policy: "{{ lookup_policy.json.results[0].pk }}"
+          target: "{{ fsb.json.results[0].pk }}"
+          order: 0
+          enabled: true
+        status_code: [201]
+      when: lookup_binding_check.json.pagination.count == 0
+
+    - name: Get cert-onboarding-create-policy
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/policies/expression/?name=cert-onboarding-create-policy"
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+      register: create_policy
+      changed_when: false
+
+    - name: Check if create PolicyBinding already exists
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/policies/bindings/?policy={{ create_policy.json.results[0].pk }}&order=1"
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+      register: create_binding_check
+      changed_when: false
+
+    - name: Create create PolicyBinding (order 1, enrollment gate)
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/policies/bindings/"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+        body_format: json
+        body:
+          policy: "{{ create_policy.json.results[0].pk }}"
+          target: "{{ fsb.json.results[0].pk }}"
+          order: 1
+          enabled: "{{ enrollment_enabled | bool }}"
+        status_code: [201]
+      when: create_binding_check.json.pagination.count == 0
+
+    - name: Update create PolicyBinding enabled state
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/policies/bindings/{{ create_binding_check.json.results[0].pk }}/"
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+        body_format: json
+        body:
+          enabled: "{{ enrollment_enabled | bool }}"
+          policy: "{{ create_policy.json.results[0].pk }}"
+          target: "{{ create_binding_check.json.results[0].target }}"
+        status_code: [200]
+      when: create_binding_check.json.pagination.count > 0
+
+    # ── New-user credential setup gate ────────────────────────────────
+    # cert-onboarding-new-user-gate is bound to the password prompt FSB (order 30)
+    # and user-write FSB (order 40). Both only run when plan.context["is_new_user"].
+    - name: Get cert-onboarding-new-user-gate policy
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/policies/expression/?name=cert-onboarding-new-user-gate"
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+      register: new_user_gate_policy
+      changed_when: false
+
+    - name: Get cert-onboarding FlowStageBinding at order 30
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/flows/bindings/?target={{ onboarding_flow.json.results[0].pk }}&order=30"
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+      register: fsb30
+      changed_when: false
+      when: new_user_gate_policy.json.pagination.count > 0
+
+    - name: Get cert-onboarding FlowStageBinding at order 40
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/flows/bindings/?target={{ onboarding_flow.json.results[0].pk }}&order=40"
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+      register: fsb40
+      changed_when: false
+      when: new_user_gate_policy.json.pagination.count > 0
+
+    - name: Get all PolicyBindings for new-user-gate policy
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/policies/bindings/?policy={{ new_user_gate_policy.json.results[0].pk }}"
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+      register: gate_bindings_all
+      changed_when: false
+      when: >-
+        new_user_gate_policy.json.pagination.count > 0 and
+        fsb30 is defined and fsb30.json.pagination.count > 0 and
+        fsb40 is defined and fsb40.json.pagination.count > 0
+
+    - name: Create new-user-gate PolicyBinding for FSB-30 (password prompt)
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/policies/bindings/"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+        body_format: json
+        body:
+          policy: "{{ new_user_gate_policy.json.results[0].pk }}"
+          target: "{{ fsb30.json.results[0].pk }}"
+          order: 0
+          enabled: true
+        status_code: [201]
+      when: >-
+        new_user_gate_policy.json.pagination.count > 0 and
+        fsb30 is defined and fsb30.json.pagination.count > 0 and
+        gate_bindings_all is defined and not (gate_bindings_all.get('skipped', false)) and
+        (gate_bindings_all.json.results | selectattr('target', 'equalto', fsb30.json.results[0].pk) | list | length) == 0
+
+    - name: Create new-user-gate PolicyBinding for FSB-40 (user write)
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/policies/bindings/"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+        body_format: json
+        body:
+          policy: "{{ new_user_gate_policy.json.results[0].pk }}"
+          target: "{{ fsb40.json.results[0].pk }}"
+          order: 0
+          enabled: true
+        status_code: [201]
+      when: >-
+        new_user_gate_policy.json.pagination.count > 0 and
+        fsb40 is defined and fsb40.json.pagination.count > 0 and
+        gate_bindings_all is defined and not (gate_bindings_all.get('skipped', false)) and
+        (gate_bindings_all.json.results | selectattr('target', 'equalto', fsb40.json.results[0].pk) | list | length) == 0
+
+    # NotificationRule: set group (authentik Admins) and enable
+    - name: Get cert-enrollment-notify NotificationRule
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/events/rules/?name=cert-enrollment-notify"
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+      register: notification_rule
+      changed_when: false
+
+    - name: Get authentik Admins group
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/core/groups/?name=authentik+Admins"
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+      register: admin_group
+      changed_when: false
+
+    - name: Get fallback superuser group if authentik Admins not found
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/core/groups/?is_superuser=true"
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+      register: superuser_groups
+      changed_when: false
+      when: admin_group.json.pagination.count == 0
+
+    - name: Enable cert-enrollment-notify rule and set group
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/events/rules/{{ notification_rule.json.results[0].pk }}/"
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+        body_format: json
+        body:
+          enabled: true
+          group: "{{ admin_group.json.results[0].pk if admin_group.json.pagination.count > 0 else superuser_groups.json.results[0].pk }}"
+        status_code: [200]
+      when: notification_rule.json.pagination.count > 0
+
+    - name: Get cert-enrollment-event-matcher policy
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/policies/expression/?name=cert-enrollment-event-matcher"
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+      register: event_matcher_policy
+      changed_when: false
+
+    - name: Check if event-matcher PolicyBinding already exists
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/policies/bindings/?policy={{ event_matcher_policy.json.results[0].pk }}&order=0"
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+      register: event_matcher_binding_check
+      changed_when: false
+      when: notification_rule.json.pagination.count > 0 and event_matcher_policy.json.pagination.count > 0
+
+    - name: Create event-matcher PolicyBinding for NotificationRule
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/policies/bindings/"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+        body_format: json
+        body:
+          policy: "{{ event_matcher_policy.json.results[0].pk }}"
+          target: "{{ notification_rule.json.results[0].pk }}"
+          order: 0
+          enabled: true
+        status_code: [201]
+      when: >-
+        event_matcher_binding_check is defined and
+        event_matcher_binding_check.json.pagination.count == 0
+
+    # Create cert-users group for enrolled users
+    - name: Check if cert-users group exists
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/core/groups/?name=cert-users"
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+      register: cert_users_group
+      changed_when: false
+
+    - name: Create cert-users group
+      uri:
+        url: "{{ authentik_api_base }}/api/v3/core/groups/"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ authentik_api_token }}"
+        body_format: json
+        body:
+          name: cert-users
+          is_superuser: false
+        status_code: [201]
+      when: cert_users_group.json.pagination.count == 0
+
+    - name: Stop kubectl port-forward
+      shell: pkill -f "kubectl port-forward.*19000" || true
+      changed_when: false
+      ignore_errors: true
+
+    - name: Print next steps
+      debug:
+        msg: |
+          Deployment complete.
+
+          Next steps:
+          1. Update authentik-ingress.yaml: replace 'auth.YOURDOMAIN' with your FQDN
+          2. Create DNS CNAME: auth.yourdomain -> ALB DNS (from terraform output alb_dns_name)
+          3. Set Authentik admin password:
+               kubectl exec -n {{ authentik_namespace }} deploy/authentik-worker -- \
+                 ak create_admin_group
+          4. Open https://auth.yourdomain/if/flow/cert-onboarding/ with client cert
+          5. Then visit https://auth.yourdomain/if/flow/credential-enrollment/ to set password/OTP/passkey

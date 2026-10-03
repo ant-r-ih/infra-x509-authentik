@@ -1,0 +1,70 @@
+# Authentik Helm chart values
+# https://github.com/goauthentik/authentik/tree/main/helm
+
+global:
+  image:
+    tag: "2026.8.3"
+
+authentik:
+  secret_key: ""  # set via --set or sealed secret; min 50 chars random
+  error_reporting:
+    enabled: false
+  postgresql:
+    host: authentik-pg-rw.authentik.svc.cluster.local
+    port: 5432
+    name: authentik
+    user: authentik
+    password: ""  # set via secret (authentik-pg-credentials)
+  redis:
+    host: authentik-redis-master.authentik.svc.cluster.local
+
+blueprints:
+  configMaps:
+    - authentik-blueprints
+
+server:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+
+  ingress:
+    enabled: false  # managed by our own authentik-ingress.yaml
+
+worker:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 6Gi
+
+# Redis: use Bitnami subchart (bundled)
+redis:
+  enabled: true
+  architecture: standalone
+  auth:
+    enabled: false
+  master:
+    resources:
+      requests:
+        memory: 64Mi
+        cpu: 20m
+      limits:
+        memory: 128Mi
+        cpu: 200m
+    persistence:
+      enabled: true
+      size: 1Gi
+      storageClass: gp3
+
+# PostgreSQL subchart disabled — using CloudNativePG instead
+postgresql:
+  enabled: false
+

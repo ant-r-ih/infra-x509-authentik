@@ -1,0 +1,22 @@
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: authentik
+  namespace: authentik
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # mTLS headers forwarded via ingress-nginx/custom-proxy-headers ConfigMap (nginx-values.yaml proxy-set-headers)
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: auth.example.org
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: authentik-server
+                port:
+                  number: 80

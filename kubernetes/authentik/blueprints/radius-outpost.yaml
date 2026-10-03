@@ -1,0 +1,118 @@
+# Authentik Blueprint: RADIUS Outpost + Provider
+#
+# RADIUS auth: username (member number) + password
+# Authentik RADIUS outpost listens on UDP 1812
+#
+# The RADIUS outpost runs as a separate Deployment in the cluster,
+# exposed via the NLB created in Terraform.
+
+version: 1
+metadata:
+  name: radius-outpost
+  labels:
+    blueprints.goauthentik.io/description: "RADIUS provider and outpost for password auth"
+
+entries:
+  # Authentication flow for RADIUS (password only, no MFA stage for now)
+  - model: authentik_flows.flow
+    identifiers:
+      slug: radius-authentication
+    attrs:
+      name: "RADIUS Authentication"
+      title: "RADIUS Authentication"
+      slug: radius-authentication
+      designation: authentication
+      authentication: none
+
+  # Identification stage: resolve username to user
+  - model: authentik_stages_identification.identificationstage
+    identifiers:
+      name: radius-identification
+    attrs:
+      name: radius-identification
+      user_fields:
+        - username
+      pretend_user_exists: true
+
+  # Password stage
+  - model: authentik_stages_password.passwordstage
+    identifiers:
+      name: radius-password
+    attrs:
+      name: radius-password
+      backends:
+        - authentik.core.auth.InbuiltBackend
+
+  # User login stage
+  - model: authentik_stages_user_login.userloginstage
+    identifiers:
+      name: radius-user-login
+    attrs:
+      name: radius-user-login
+      session_duration: "hours=1"
+      remember_me_offset: "days=0"
+
+  # Flow bindings
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !Find [authentik_flows.flow, [slug, radius-authentication]]
+      order: 10
+    attrs:
+      target: !Find [authentik_flows.flow, [slug, radius-authentication]]
+      stage: !Find [authentik_stages_identification.identificationstage, [name, radius-identification]]
+      order: 10
+
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !Find [authentik_flows.flow, [slug, radius-authentication]]
+      order: 20
+    attrs:
+      target: !Find [authentik_flows.flow, [slug, radius-authentication]]
+      stage: !Find [authentik_stages_password.passwordstage, [name, radius-password]]
+      order: 20
+
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !Find [authentik_flows.flow, [slug, radius-authentication]]
+      order: 30
+    attrs:
+      target: !Find [authentik_flows.flow, [slug, radius-authentication]]
+      stage: !Find [authentik_stages_user_login.userloginstage, [name, radius-user-login]]
+      order: 30
+
+  # Invalidation flow (required by RadiusProvider in 2026.x)
+  - model: authentik_flows.flow
+    identifiers:
+      slug: radius-invalidation
+    attrs:
+      name: "RADIUS Invalidation"
+      title: "RADIUS Invalidation"
+      slug: radius-invalidation
+      designation: invalidation
+      authentication: none
+
+  # RADIUS Provider
+  - model: authentik_providers_radius.radiusprovider
+    identifiers:
+      name: radius-provider
+    attrs:
+      name: "RADIUS Provider"
+      authorization_flow: !Find [authentik_flows.flow, [slug, radius-authentication]]
+      invalidation_flow: !Find [authentik_flows.flow, [slug, radius-invalidation]]
+      shared_secret: "CHANGE_ME_RADIUS_SECRET"
+      client_networks: "0.0.0.0/0"
+
+  # RADIUS Outpost
+  - model: authentik_outposts.outpost
+    identifiers:
+      name: radius-outpost
+    attrs:
+      name: "RADIUS Outpost"
+      type: radius
+      providers:
+        - !Find [authentik_providers_radius.radiusprovider, [name, radius-provider]]
+      config:
+        authentik_host: "http://authentik-server.authentik.svc.cluster.local"
+        authentik_host_insecure: true
+        kubernetes_replicas: 1
+        kubernetes_service_type: ClusterIP

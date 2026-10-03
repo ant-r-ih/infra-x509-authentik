@@ -1,0 +1,300 @@
+# Authentik Blueprint: Certificate-based Onboarding Flow
+#
+# Flow: user hits /flows/enroll/cert-onboarding/ with client cert
+# ALB mTLS passes X-Amzn-Mtls-Clientcert-Subject (URL-encoded RFC 4514 DN)
+# Example decoded: C=JP,O=client CA,CN=1234 Alice Example 01,emailAddress=user@example.org
+#
+# Design notes for Authentik 2026.x:
+#   - Expression Stage was removed; Expression Policy is used instead.
+#   - PolicyBinding must target a FlowStageBinding (not a Stage directly).
+#   - FlowStageBinding.evaluate_on_plan=True makes the policy run during
+#     FlowPlanner.plan(), giving it access to request.context["flow_plan"].
+#     Writing to plan.context["pending_user"] there persists into the
+#     flow execution context, making UserLoginStage find the user.
+#   - PolicyBindings on flows (flow-level) do NOT propagate context to
+#     the FlowPlan — only evaluate_on_plan bindings do.
+#
+# Parsed CN fields:
+#   username  : first numeric token of CN  (e.g. "1234")
+#   name      : middle tokens of CN        (e.g. "Alice Example")
+#   email     : emailAddress RDN value
+
+version: 1
+metadata:
+  name: cert-onboarding
+  labels:
+    blueprints.goauthentik.io/description: "X.509 cert-based user onboarding"
+
+entries:
+  # ── Flow definition ───────────────────────────────────────────────
+  - model: authentik_flows.flow
+    identifiers:
+      slug: cert-onboarding
+    attrs:
+      name: "Certificate Onboarding"
+      title: "Certificate Onboarding"
+      slug: cert-onboarding
+      designation: enrollment
+      authentication: none
+      layout: stacked
+
+  # ── Policy A: cert-lookup ─────────────────────────────────────────
+  # Parses the mTLS header and looks up an EXISTING user.
+  # Runs at order=0 on the FlowStageBinding (evaluate_on_plan=True).
+  # Returns True (and sets pending_user) if the user already exists.
+  # Returns False if the user is unknown — defers to cert-create policy.
+  - model: authentik_policies_expression.expressionpolicy
+    identifiers:
+      name: cert-onboarding-lookup-policy
+    attrs:
+      name: cert-onboarding-lookup-policy
+      expression: |
+        from urllib.parse import unquote
+        from authentik.core.models import User
+
+        raw = request.http_request.META.get("HTTP_X_AMZN_MTLS_CLIENTCERT_SUBJECT", "")
+        if not raw:
+            ak_logger.warning("cert-onboarding: no client certificate presented")
+            return False
+
+        dn = unquote(raw.replace("+", " "))
+        fields = {}
+        for part in dn.split(","):
+            part = part.strip()
+            if "=" in part:
+                k, _, v = part.partition("=")
+                fields[k.strip().lower()] = v.strip()
+
+        cn = fields.get("cn", "")
+        tokens = cn.split() if cn else []
+        if not tokens or not tokens[0].isdigit():
+            ak_logger.warning("cert-onboarding: invalid CN: %s", cn)
+            return False
+
+        username = tokens[0]
+        user = User.objects.filter(username=username).first()
+        if not user:
+            return False  # unknown user — let cert-create policy handle it
+
+        plan = request.context.get("flow_plan")
+        if plan is None:
+            return False
+        plan.context["pending_user"] = user
+        return True
+
+  # ── Policy B: cert-create ─────────────────────────────────────────
+  # JIT-provisions a NEW user from the cert subject and sets pending_user.
+  # Runs at order=1 on the FlowStageBinding (evaluate_on_plan=True).
+  #
+  # Enrollment on/off: disable this PolicyBinding in the Authentik admin GUI
+  # (Flows & Stages → Flows → cert-onboarding → Bindings → cert-create → toggle)
+  # or via Ansible: ansible-playbook deploy.yml -e enrollment_enabled=false
+  - model: authentik_policies_expression.expressionpolicy
+    identifiers:
+      name: cert-onboarding-create-policy
+    attrs:
+      name: cert-onboarding-create-policy
+      expression: |
+        from urllib.parse import unquote
+        from authentik.core.models import User, Group
+
+        plan = request.context.get("flow_plan")
+        if plan is None:
+            return False
+
+        # Skip creation if lookup already resolved the user
+        if plan.context.get("pending_user"):
+            return True
+
+        raw = request.http_request.META.get("HTTP_X_AMZN_MTLS_CLIENTCERT_SUBJECT", "")
+        if not raw:
+            return False
+
+        dn = unquote(raw.replace("+", " "))
+        fields = {}
+        for part in dn.split(","):
+            part = part.strip()
+            if "=" in part:
+                k, _, v = part.partition("=")
+                fields[k.strip().lower()] = v.strip()
+
+        cn = fields.get("cn", "")
+        tokens = cn.split() if cn else []
+        if not tokens or not tokens[0].isdigit():
+            return False
+
+        username = tokens[0]
+        name_tokens = [t for t in tokens[1:] if not (t.isdigit() and t == tokens[-1])]
+        full_name = " ".join(name_tokens)
+        email = fields.get("emailaddress", "")
+
+        user, created = User.objects.get_or_create(
+            username=username,
+            defaults={
+                "name": full_name,
+                "email": email,
+                "is_active": True,
+                "attributes": {"enrollment_source": "x509"},
+            },
+        )
+        group, _ = Group.objects.get_or_create(name="cert-users")
+        user.ak_groups.add(group)
+
+        if created:
+            # Audit event — visible to admins in Events → Audit Log
+            ak_create_event(
+                "cert_enrollment",
+                message=f"New certificate enrollment: {username} ({full_name}, {email})",
+            )
+            # In-app bell notification for superuser-group members (if configured)
+            try:
+                from authentik.events.models import Notification
+                from authentik.core.models import Group
+                admins = User.objects.filter(
+                    ak_groups__in=Group.objects.filter(is_superuser=True)
+                ).distinct()
+                for admin in admins:
+                    Notification.objects.create(
+                        user=admin, body=f"New certificate enrollment: {username} ({full_name}, {email})",
+                        seen=False, severity="notice",
+                    )
+            except Exception as e:
+                ak_logger.warning("cert-onboarding: bell notification failed: %s", e)
+
+            # Flag new users so evaluate_on_plan bindings at order 30/40
+            # (optional password/write stages) are included in the plan.
+            plan.context["is_new_user"] = True
+
+        plan.context["pending_user"] = user
+        return True
+
+  # ── Policy C: new-user gate ───────────────────────────────────────
+  # Used as a PolicyBinding on orders 30 and 40 so that optional
+  # credential-setup stages only run for newly created users.
+  # PolicyBindings for these are created via Ansible (not blueprint).
+  - model: authentik_policies_expression.expressionpolicy
+    identifiers:
+      name: cert-onboarding-new-user-gate
+    attrs:
+      name: cert-onboarding-new-user-gate
+      expression: |
+        plan = request.context.get("flow_plan")
+        if plan is None:
+            return False
+        return bool(plan.context.get("is_new_user", False))
+
+  # ── Stage: Optional password setup (new users only) ───────────────
+  # continue_flow_without_input=True lets the user skip password setup.
+  - model: authentik_stages_prompt.promptstage
+    identifiers:
+      name: cert-onboarding-prompt-password
+    attrs:
+      name: cert-onboarding-prompt-password
+      continue_flow_without_input: true
+      fields:
+        - !Find [authentik_stages_prompt.prompt, [field_key, password]]
+        - !Find [authentik_stages_prompt.prompt, [field_key, password_repeat]]
+
+  # ── Stage: User login ─────────────────────────────────────────────
+  - model: authentik_stages_user_login.userloginstage
+    identifiers:
+      name: cert-onboarding-user-login
+    attrs:
+      name: cert-onboarding-user-login
+      session_duration: "hours=8"
+      remember_me_offset: "days=0"
+
+  # ── Flow stage binding (evaluate_on_plan=True required) ───────────
+  # evaluate_on_plan=True: policy runs during planning so it can access
+  # flow_plan and write pending_user before UserLoginStage executes.
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !Find [authentik_flows.flow, [slug, cert-onboarding]]
+      order: 20
+    attrs:
+      target: !Find [authentik_flows.flow, [slug, cert-onboarding]]
+      stage: !Find [authentik_stages_user_login.userloginstage, [name, cert-onboarding-user-login]]
+      order: 20
+      evaluate_on_plan: true
+
+  # ── Flow stage binding: optional password prompt (new users, order 30) ──
+  # PolicyBinding (new-user-gate → this FSB) is created via Ansible.
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !Find [authentik_flows.flow, [slug, cert-onboarding]]
+      order: 30
+    attrs:
+      target: !Find [authentik_flows.flow, [slug, cert-onboarding]]
+      stage: !Find [authentik_stages_prompt.promptstage, [name, cert-onboarding-prompt-password]]
+      order: 30
+      evaluate_on_plan: true
+
+  # ── Stage: User write for optional password (new users only) ────────
+  - model: authentik_stages_user_write.userwritestage
+    identifiers:
+      name: cert-onboarding-user-write
+    attrs:
+      name: cert-onboarding-user-write
+      user_creation_mode: never_create
+
+  # ── Flow stage binding: user write for password (new users, order 40) ───
+  # Saves the password entered at order 30.
+  # PolicyBinding (new-user-gate → this FSB) is created via Ansible.
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !Find [authentik_flows.flow, [slug, cert-onboarding]]
+      order: 40
+    attrs:
+      target: !Find [authentik_flows.flow, [slug, cert-onboarding]]
+      stage: !Find [authentik_stages_user_write.userwritestage, [name, cert-onboarding-user-write]]
+      order: 40
+      evaluate_on_plan: true
+
+  # ── Notification: local bell on new enrollment ───────────────────
+  # When cert-create policy fires ak_create_event("cert_enrollment", ...),
+  # Authentik matches it against NotificationRules. This rule sends a bell
+  # notification to members of any group with is_superuser=True.
+  # PolicyBinding (event-matcher policy → NotificationRule) is created via Ansible.
+
+  - model: authentik_events.notificationtransport
+    identifiers:
+      name: cert-enrollment-local
+    attrs:
+      name: cert-enrollment-local
+      mode: local
+      send_once: false
+
+  - model: authentik_policies_expression.expressionpolicy
+    identifiers:
+      name: cert-enrollment-event-matcher
+    attrs:
+      name: cert-enrollment-event-matcher
+      expression: |
+        event = request.context.get("event")
+        if not event:
+            return False
+        action = event.action if hasattr(event, "action") else event.get("action", "")
+        return action == "custom_cert_enrollment"
+
+  - model: authentik_events.notificationrule
+    identifiers:
+      name: cert-enrollment-notify
+    attrs:
+      name: cert-enrollment-notify
+      severity: notice
+      enabled: true
+      transports:
+        - !Find [authentik_events.notificationtransport, [name, cert-enrollment-local]]
+
+  # NOTE: PolicyBindings (cert-lookup and cert-create → FlowStageBinding, and
+  # event-matcher → NotificationRule) are created via Ansible REST API calls.
+  # Blueprint PolicyBinding entries cause UUID-conflict errors on re-apply.
+  #
+  # The Ansible API token (ansible-automation-token) is created by Authentik's
+  # AUTHENTIK_BOOTSTRAP_TOKEN env var on first startup (set via Helm bootstrap_token).
+  #
+  # Enrollment on/off (admin GUI):
+  #   Flows & Stages → Flows → cert-onboarding → Bindings
+  #   → disable/enable the cert-create PolicyBinding
+  # Enrollment on/off (Ansible):
+  #   ansible-playbook deploy.yml -e enrollment_enabled=false

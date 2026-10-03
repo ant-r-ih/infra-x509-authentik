@@ -1,0 +1,43 @@
+---
+# ALB Ingress managed by AWS Load Balancer Controller.
+# Replaces the Terraform-managed ALB; mTLS is handled here.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: authentik-alb
+  namespace: authentik
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS": 443}]'
+
+    # ACM certificate — set to your certificate ARN after terraform apply
+    alb.ingress.kubernetes.io/certificate-arn: "arn:aws:acm:REGION:ACCOUNT_ID:certificate/CERTIFICATE_ID"
+    alb.ingress.kubernetes.io/ssl-policy: "ELBSecurityPolicy-TLS13-1-2-2021-06"
+
+    # mTLS: verify client certificate against client CA
+    # trustStore ARN is output by terraform as alb_trust_store_arn
+    alb.ingress.kubernetes.io/mutual-authentication: |
+      [{"port": 443, "mode": "verify", "trustStore": "arn:aws:elasticloadbalancing:REGION:ACCOUNT_ID:truststore/CLUSTER_NAME-client-ca/TRUST_STORE_ID", "ignoreClientCertificateExpiry": false}]
+
+    # Restrict to allowed network
+    alb.ingress.kubernetes.io/inbound-cidrs: "0.0.0.0/0"
+
+    # Health check against Authentik's health endpoint
+    alb.ingress.kubernetes.io/healthcheck-path: "/-/health/live/"
+    alb.ingress.kubernetes.io/healthcheck-port: "9000"
+    alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
+    alb.ingress.kubernetes.io/success-codes: "200"
+spec:
+  ingressClassName: alb
+  rules:
+    - host: auth.example.org
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: authentik-server
+                port:
+                  number: 80

@@ -1,0 +1,19 @@
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.backup
+*.tfvars
+!*.tfvars.example
+terraform.tfplan
+crash.log
+
+# Secrets — never commit
+kubernetes/cnpg/secret.yaml
+kubernetes/authentik/secrets.yaml
+ansible/.vault_pass
+.env
+pki/ca-bundle.pem
+
+# macOS
+.DS_Store
