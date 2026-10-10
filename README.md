@@ -6,7 +6,7 @@ name `Alice Example`; an emailAddress RDN supplies the optional email.
 
 ```text
 Browser with client certificate
-  → shared NLB (TCP 443; also serves RADIUS UDP 1812)
+  → shared NLB (TCP 443; TCP 80 for ACME, UDP 1812 for RADIUS)
   → nginx Deployment (TLS + mandatory mTLS, private CA verification)
   → Authentik Service
   → certificate onboarding → existing account or permitted JIT enrollment
@@ -34,6 +34,8 @@ See [SETUP.md](SETUP.md) for deployment and **staged migration from the existing
 ALB**. `retain_legacy_alb=true` preserves the old ALB during verification and DNS
 cutover. Only disable it after completing that procedure.
 
-This branch implements private-CA enrollment and authentication only.
+The current configuration implements private-CA enrollment and authentication only.
 The private CA bundle is supplied locally as `pki/ca-bundle.pem`.
-JPKI linking and certificate-free login are outside this change.
+HTTPS requires a trusted client certificate, including when using password
+or MFA stages.
+TLS 1.2 and TLS 1.3 are enabled.

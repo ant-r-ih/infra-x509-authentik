@@ -2,8 +2,9 @@
 
 ## Architecture
 
-Terraform retains the existing `aws_lb.radius` resource and adds TCP 443 to it.
-The NLB uses IP targets and PROXY protocol v2. nginx terminates TLS/mTLS on 8443,
+Terraform retains the existing `aws_lb.radius` resource and adds TCP 80 and 443.
+Both new target groups use IP targets; only HTTPS uses PROXY protocol v2.
+nginx terminates TLS/mTLS on 8443,
 checks the client certificate against the private CA bundle, applies
 `allowed_cidrs` to the original address, and proxies to Authentik. TCP 443 passes
 through the NLB unchanged; there is no NLB TLS/ACM listener.
@@ -27,9 +28,12 @@ registers/deregisters Pod IP targets as replicas change.
 
 Use Terraform >= 1.7, Ansible with the collections in `ansible/requirements.yml`,
 kubectl, Helm, and AWS CLI. Commands below use AWS profile **ANT**.
+Run Terraform commands from the repository root with `-chdir` as shown;
+run Ansible commands from `ansible/` so `ansible.cfg` and inventory paths resolve.
 
-Copy `terraform/environments/prod/terraform.tfvars.example` to
-`terraform.tfvars` and set the existing infrastructure values plus:
+For a new installation, copy `terraform/environments/prod/terraform.tfvars.example`
+to `terraform/environments/prod/terraform.tfvars` and set the values below.
+For an existing installation, edit its current file instead of overwriting it:
 
 ```hcl
 aws_profile          = "ANT"
@@ -43,11 +47,23 @@ For an existing installation, retain the original `ca_bundle_s3_bucket` and
 the ALB is removed; it is not force-deleted. New installations leave the bucket
 variable empty and create no CA archive in S3. nginx reads its CA bundle from
 `pki/ca-bundle.pem`, copied into a ConfigMap by Ansible. This file must contain
-only the private CAs authorized to enroll members, not JPKI roots.
+only the private CAs authorized to enroll members.
 
 Bootstrap credentials still come from `.env` (`TF_VAR_authentik_bootstrap_email`
 and `TF_VAR_authentik_bootstrap_password`). Do not replace an existing state or
 regenerate application secrets during migration.
+
+For a new installation, copy `.env.example` to `.env`, replace its placeholders,
+and run `source .env`. Terraform generates the application secret key, database
+password and automation token; the operator supplies the bootstrap admin password.
+
+Ansible reads host variables from Terraform state through
+`ansible/inventory/terraform.yml`. In particular, `aws_profile` is passed explicitly
+to `aws eks update-kubeconfig`; setting `AWS_PROFILE=ANT` alone does not override
+an inventory value of `ikob`. Use the correct account's existing state and match
+its `aws_profile` setting. Do not switch accounts by applying an existing state
+with a different profile. If using separate checkouts/backends for each account,
+ensure the inventory's `project_path` refers to that account's Terraform project.
 
 ## HTTP01 validation and DNS
 
@@ -76,12 +92,6 @@ hostname at the NLB. A plain `http://<hostname>/` should return 404. Then run th
 full playbook to install/configure cert-manager, issue the certificate, and start
 nginx. The full playbook otherwise waits for Certificate Ready while DNS is wrong.
 Keep production and development Terraform states separate when using ANT and ikob.
-
-If this branch's earlier DNS01 configuration was already applied, Terraform
-will remove its cert-manager IAM role/policy. The DNS-account updater role is
-outside this state; arrange separate cleanup if it was created. The updated
-cert-manager Helm values remove its IRSA annotation. Do not uninstall cert-manager
-or delete the existing TLS Secret during this transition.
 
 For initial testing you may set:
 
@@ -119,7 +129,7 @@ certificate waits default to 1800 seconds (`-e startup_timeout=3600` to adjust).
    **`retain_legacy_alb=true`** and the ACME email before planning. `moved`
    blocks preserve existing ALB/ACM/S3 resource identities when adding counts.
    Confirm the plan retains the EKS cluster, node group, database volumes,
-   shared RADIUS NLB and existing ALB. This branch does not switch to ARM.
+   shared RADIUS NLB and existing ALB. This migration does not switch to ARM.
 2. Apply Terraform, then bootstrap HTTP with `--tags acme-http` as above.
    If the hostname still points to the ALB, HTTP01 cannot validate through the
    NLB yet. Schedule an initial issuance window: switch DNS, run the full playbook,
@@ -135,7 +145,8 @@ certificate waits default to 1800 seconds (`-e startup_timeout=3600` to adjust).
      https://auth.example.org/if/flow/cert-onboarding/
    ```
 
-   A request without a certificate or with an untrusted certificate must fail. Check `kubectl get pods -n authentik-edge` and target health.
+   A request without a certificate or with an untrusted certificate must fail.
+   Check `kubectl get pods -n authentik-edge` and target health.
    Verify real browser enrollment and an existing user's certificate login;
    an HTTP redirect alone is not proof that the Authentik flow succeeds.
 4. Keep the public DNS CNAME at `nlb_dns_name`. Keep the ALB through the old
@@ -164,6 +175,34 @@ certificate waits default to 1800 seconds (`-e startup_timeout=3600` to adjust).
 These cleanup commands are intentionally separate from routine deployment.
 After step 6, rollback requires recreating the ALB/ACM and restoring its binding.
 
+## Updating an existing NLB deployment
+
+For nginx templates, the private CA bundle, or Authentik blueprints, rerun Ansible
+against the existing inventory; no Terraform apply is needed if its resources and
+host variables have not changed:
+
+```sh
+cd ansible
+AWS_PROFILE=ANT ansible-playbook playbooks/deploy.yml
+```
+
+Changes to NLB listeners, IAM, EKS, or Terraform-provided host variables require a
+Terraform plan/apply first. This includes `authentik_domain`, `acme_email`,
+`acme_server`, and `allowed_cidrs`, since Ansible reads them from state.
+
+If deployment failed during the REST API configuration phase, after fixing the
+cause it can resume from the port-forward setup using the same profile and extra
+variables as the original run:
+
+```sh
+cd ansible
+AWS_PROFILE=ANT ansible-playbook playbooks/deploy.yml \
+  --start-at-task "Kill any existing port-forward on port 19000"
+```
+
+This skips Helm, ConfigMaps and nginx deployment. Do not use this shortcut for a
+blueprint or nginx change that still needs to be deployed.
+
 ## Certificate identity and renewal
 
 nginx overwrites `X-Amzn-Mtls-Clientcert-Leaf` with the verified client leaf
@@ -174,7 +213,6 @@ incoming Subject header. Do not expose Authentik's HTTP Service directly to
 untrusted clients; direct access would bypass proxy authentication.
 
 The existing private-CA CN format and enrollment gate remain unchanged.
-JPKI linking and certificate-free login are not part of this configuration.
 The certificate CA bundle establishes trust; automatic client-certificate
 revocation checking is not configured by this migration. If revocation is
 required, configure CRL/OCSP handling separately before relying on that property.
