@@ -17,11 +17,5 @@ acme_email          = "admin@example.org"
 # For initial HTTP validation testing (staging certificates are NOT browser-trusted):
 # acme_server = "https://acme-staging-v02.api.letsencrypt.org/directory"
 
-# Existing installations: set true until NLB testing and DNS cutover are complete.
-retain_legacy_alb = false
-# Keep the original value if an existing versioned S3 archive is managed:
-# ca_bundle_s3_bucket = "your-existing-x509-authentik-assets"
-# ca_bundle_s3_key = "ca-bundle.pem"
-
 # Sensitive: set via .env as TF_VAR_authentik_bootstrap_email instead of here
 # authentik_bootstrap_email = "admin@example.org"

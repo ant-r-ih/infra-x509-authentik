@@ -1,23 +1,20 @@
-# Deployment and ALB migration
+# Deployment and operation
 
 ## Architecture
 
-Terraform retains the existing `aws_lb.radius` resource and adds TCP 80 and 443.
-Both new target groups use IP targets; only HTTPS uses PROXY protocol v2.
+Terraform manages a shared NLB with TCP 80/443 and RADIUS UDP 1812 listeners.
+Both HTTP target groups use IP targets; only HTTPS uses PROXY protocol v2.
 nginx terminates TLS/mTLS on 8443,
 checks the client certificate against the private CA bundle, applies
 `allowed_cidrs` to the original address, and proxies to Authentik. TCP 443 passes
-through the NLB unchanged; there is no NLB TLS/ACM listener.
+through the NLB unchanged.
 TCP 80 forwards plain HTTP to a dedicated Traefik controller on port 8000,
 which routes cert-manager HTTP01 challenge Ingresses. It has no Authentik
 route and returns 404 for unmatched paths. This path starts without a TLS Secret.
 
-The NLB was originally created without a security group. This migration keeps
-its identity instead of replacing it to attach one. HTTPS client CIDR filtering
-therefore happens in nginx. Nodes allow the VPC/NLB traffic to the target port;
-the NLB uses TCP health checks. Kubernetes probes use a separate internal HTTP
-health endpoint. Existing RADIUS target registration and access policy are not
-changed by this migration.
+The NLB has no security group. HTTPS client CIDR filtering happens in nginx.
+Nodes allow VPC/NLB traffic to the target ports. The NLB uses TCP health checks;
+Kubernetes probes use a separate internal HTTP health endpoint.
 
 nginx runs as non-root with a read-only root filesystem, two replicas and a
 PodDisruptionBudget. Increase `nginx_replicas` with Ansible if needed; an HPA and
@@ -41,19 +38,14 @@ For an existing installation, edit its current file instead of overwriting it:
 aws_profile          = "infra-prod"
 authentik_domain     = "auth.example.org"
 acme_email           = "admin@example.org"
-retain_legacy_alb    = false # NEW INSTALLS ONLY; existing ALB: start with true
 ```
 
-For an existing installation, retain the original `ca_bundle_s3_bucket` and
-`ca_bundle_s3_key` values. The versioned S3 archive remains managed even after
-the ALB is removed; it is not force-deleted. New installations leave the bucket
-variable empty and create no CA archive in S3. nginx reads its CA bundle from
-`pki/ca-bundle.pem`, copied into a ConfigMap by Ansible. This file must contain
-only the private CAs authorized to enroll members.
+nginx reads its trusted client CA bundle from `pki/ca-bundle.pem`, copied into a
+ConfigMap by Ansible. Include only the private CAs authorized to enroll members.
 
 Bootstrap credentials still come from `.env` (`TF_VAR_authentik_bootstrap_email`
 and `TF_VAR_authentik_bootstrap_password`). Do not replace an existing state or
-regenerate application secrets during migration.
+regenerate application secrets when updating a deployment.
 
 For a new installation, copy `.env.example` to `.env`, replace its placeholders,
 and run `source .env`. Terraform generates the application secret key, database
@@ -125,57 +117,13 @@ Point `authentik_domain`'s DNS CNAME to Terraform's `nlb_dns_name` output before
 requesting the first certificate. Startup and
 certificate waits default to 1800 seconds (`-e startup_timeout=3600` to adjust).
 
-## Existing ALB: staged migration
+## Verify the deployment
 
-1. Back up the Terraform state and existing DNS record. Set
-   **`retain_legacy_alb=true`** and the ACME email before planning. `moved`
-   blocks preserve existing ALB/ACM/S3 resource identities when adding counts.
-   Confirm the plan retains the EKS cluster, node group, database volumes,
-   shared RADIUS NLB and existing ALB. This migration does not switch to ARM.
-2. Apply Terraform, then bootstrap HTTP with `--tags acme-http` as above.
-   If the hostname still points to the ALB, HTTP01 cannot validate through the
-   NLB yet. Schedule an initial issuance window: switch DNS, run the full playbook,
-   and wait for certificate issuance and nginx rollout. During this window HTTPS
-   on the new NLB may be unavailable. Retain the ALB for DNS rollback. For a
-   zero-downtime ALB migration, a separately planned HTTP challenge forwarding
-   path or an already valid TLS Secret is required.
-3. Verify new NLB access with a private-CA client certificate and its private key:
-
-   ```sh
-   curl --connect-to auth.example.org:443:<nlb-dns-name>:443 \
-     --cert /path/to/client.pem --key /path/to/client.key \
-     https://auth.example.org/if/flow/cert-onboarding/
-   ```
-
-   A request without a certificate or with an untrusted certificate must fail.
-   Check `kubectl get pods -n authentik-edge` and target health.
-   Verify real browser enrollment and an existing user's certificate login;
-   an HTTP redirect alone is not proof that the Authentik flow succeeds.
-4. Keep the public DNS CNAME at `nlb_dns_name`. Keep the ALB through the old
-   DNS TTL and complete application checks. To roll back at this stage, point
-   DNS back to `legacy_alb_dns_name`; both paths use the same Authentik database.
-5. **Before deleting the ALB target group**, remove its Kubernetes binding so
-   its finalizer can deregister targets while AWS resources still exist:
-
-   ```sh
-   AWS_PROFILE=infra-prod kubectl delete targetgroupbinding authentik-server -n authentik
-   ```
-
-6. Set `retain_legacy_alb=false`, review `terraform plan`, then apply. This removes
-   the legacy ALB, listener, target group, trust store and ACM certificate. It
-   retains the versioned S3 archive. Do not remove the archive bucket variable
-   casually: S3 object versions require separate deliberate cleanup.
-7. After cutover, remove the retired community ingress-nginx release and unused
-   manifests from the live cluster (the new Deployment uses a different namespace):
-
-   ```sh
-   helm uninstall ingress-nginx -n ingress-nginx
-   kubectl delete ingress authentik -n authentik --ignore-not-found
-   kubectl delete configmap custom-proxy-headers -n ingress-nginx --ignore-not-found
-   ```
-
-These cleanup commands are intentionally separate from routine deployment.
-After step 6, rollback requires recreating the ALB/ACM and restoring its binding.
+With public DNS pointing at the NLB, open `/if/flow/cert-onboarding/` with a
+trusted private-CA client certificate. Verify new-user enrollment and an
+existing user's certificate login. A redirect alone does not prove the flow
+completed. Requests without a certificate or with an untrusted certificate
+must fail. Check `kubectl get pods -n authentik-edge` and target group health.
 
 ## Updating an existing NLB deployment
 
@@ -208,7 +156,7 @@ blueprint or nginx change that still needs to be deployed.
 ## Certificate identity and renewal
 
 nginx overwrites `X-Amzn-Mtls-Clientcert-Leaf` with the verified client leaf
-certificate. The legacy header name lets ALB and nginx coexist during cutover.
+certificate.
 The flow decodes the URL-encoded PEM using `unquote`, parses X.509 with
 `cryptography`, and extracts CN/email from the certificate. It never trusts an
 incoming Subject header. Do not expose Authentik's HTTP Service directly to
@@ -216,7 +164,7 @@ untrusted clients; direct access would bypass proxy authentication.
 
 The existing private-CA CN format and enrollment gate remain unchanged.
 The certificate CA bundle establishes trust; automatic client-certificate
-revocation checking is not configured by this migration. If revocation is
+revocation checking is not configured. If revocation is
 required, configure CRL/OCSP handling separately before relying on that property.
 
 cert-manager renews the server certificate and updates `authentik-web-tls`.

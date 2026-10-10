@@ -52,8 +52,7 @@ http {
             proxy_set_header Upgrade $http_upgrade;
             proxy_set_header Connection $connection_upgrade;
             proxy_read_timeout 300s;
-            # Overwrite client-supplied identity headers. Retain the ALB leaf
-            # header name during migration; the flow parses the actual X.509.
+            # Overwrite the identity header; the flow parses the actual X.509.
             proxy_set_header X-Amzn-Mtls-Clientcert-Leaf $ssl_client_escaped_cert;
             proxy_set_header X-Amzn-Mtls-Clientcert-Subject $ssl_client_s_dn;
             proxy_set_header X-Amzn-Mtls-Clientcert-Issuer $ssl_client_i_dn;

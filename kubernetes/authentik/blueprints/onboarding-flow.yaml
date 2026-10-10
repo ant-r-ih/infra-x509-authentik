@@ -1,7 +1,7 @@
 # Authentik Blueprint: Certificate-based Onboarding Flow
 #
 # Flow: user hits /flows/enroll/cert-onboarding/ with client cert
-# nginx (or legacy ALB) passes X-Amzn-Mtls-Clientcert-Leaf (URL-encoded PEM)
+# nginx passes X-Amzn-Mtls-Clientcert-Leaf (URL-encoded PEM)
 # Example decoded: C=JP,O=client CA,CN=1234 Alice Example 01,emailAddress=user@example.org
 #
 # Design notes for Authentik 2026.x:

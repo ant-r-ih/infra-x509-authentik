@@ -15,10 +15,6 @@ output "nlb_target_group_arn" {
   value = aws_lb_target_group.nginx_https.arn
 }
 
-output "legacy_alb_dns_name" {
-  value = var.retain_legacy_alb ? aws_lb.main[0].dns_name : null
-}
-
 output "nlb_http_target_group_arn" {
   value = aws_lb_target_group.acme_http.arn
 }

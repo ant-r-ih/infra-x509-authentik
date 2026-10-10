@@ -105,31 +105,7 @@ resource "aws_route_table_association" "private" {
   route_table_id = aws_route_table.private.id
 }
 
-# ALB Security Group: only allow allowed network
-resource "aws_security_group" "alb" {
-  name        = "${var.name}-alb-sg"
-  description = "ALB: allow HTTPS from allowed network only"
-  vpc_id      = aws_vpc.main.id
-
-  ingress {
-    description = "HTTPS from client CA"
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = var.allowed_cidrs
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = merge(var.tags, { Name = "${var.name}-alb-sg" })
-}
-
-# EKS node SG: allow from ALB and within VPC
+# EKS node SG: allow traffic within the VPC
 resource "aws_security_group" "eks_nodes" {
   name        = "${var.name}-eks-nodes-sg"
   description = "EKS worker nodes"

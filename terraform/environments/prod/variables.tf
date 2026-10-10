@@ -60,18 +60,6 @@ variable "authentik_domain" {
   description = "FQDN for Authentik, e.g. auth.example.org"
 }
 
-variable "ca_bundle_s3_bucket" {
-  type        = string
-  default     = ""
-  description = "Legacy CA archive bucket; keep existing value during migration, omit for new installs"
-}
-
-variable "ca_bundle_s3_key" {
-  type        = string
-  default     = "ca-bundle.pem"
-  description = "S3 key for CA bundle"
-}
-
 variable "authentik_bootstrap_email" {
   type        = string
   description = "Email address for the initial akadmin account"
@@ -81,12 +69,6 @@ variable "authentik_bootstrap_password" {
   type        = string
   sensitive   = true
   description = "Password for the initial akadmin account (set by operator)"
-}
-
-variable "retain_legacy_alb" {
-  type        = bool
-  default     = false
-  description = "Set true during migration; disable only after NLB HTTPS verification and DNS cutover"
 }
 
 variable "acme_email" {

@@ -208,8 +208,6 @@ resource "ansible_host" "deploy" {
     aws_profile      = var.aws_profile
     authentik_domain = var.authentik_domain
 
-    alb_target_group_arn      = var.retain_legacy_alb ? aws_lb_target_group.https[0].arn : ""
-    retain_legacy_alb         = tostring(var.retain_legacy_alb)
     nlb_target_group_arn      = aws_lb_target_group.nginx_https.arn
     nlb_http_target_group_arn = aws_lb_target_group.acme_http.arn
     nlb_dns_name              = aws_lb.radius.dns_name

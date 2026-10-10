@@ -290,24 +290,6 @@
         --timeout={{ startup_timeout }}s -n {{ ingress_namespace }}
       changed_when: false
 
-    # Leave the old binding in place until DNS has been migrated.
-    - name: Retain legacy ALB target binding during migration
-      kubernetes.core.k8s:
-        state: present
-        definition:
-          apiVersion: elbv2.k8s.aws/v1beta1
-          kind: TargetGroupBinding
-          metadata:
-            name: authentik-server
-            namespace: "{{ authentik_namespace }}"
-          spec:
-            serviceRef:
-              name: authentik-server
-              port: 80
-            targetGroupARN: "{{ alb_target_group_arn }}"
-            targetType: ip
-      when: retain_legacy_alb | default(false) | bool
-
     - name: Restart authentik-worker to apply mounted blueprints
       kubernetes.core.k8s:
         api_version: apps/v1
@@ -399,24 +381,6 @@
       delay: 10
       until: onboarding_flow_check.json.pagination.count > 0
       changed_when: false
-
-    # Remove legacy combined policy if it survived a previous deploy
-    - name: Find legacy cert-onboarding-parse-cert-policy
-      uri:
-        url: "{{ authentik_api_base }}/api/v3/policies/expression/?name=cert-onboarding-parse-cert-policy"
-        headers:
-          Authorization: "Bearer {{ authentik_api_token }}"
-      register: legacy_policy
-      changed_when: false
-
-    - name: Remove legacy cert-onboarding-parse-cert-policy
-      uri:
-        url: "{{ authentik_api_base }}/api/v3/policies/expression/{{ legacy_policy.json.results[0].pk }}/"
-        method: DELETE
-        headers:
-          Authorization: "Bearer {{ authentik_api_token }}"
-        status_code: [204]
-      when: legacy_policy.json.pagination.count > 0
 
     # PolicyBindings cannot be created via blueprint (two-phase UUID mismatch).
     # evaluate_on_plan=True is required so policies run during FlowPlanner.plan()
@@ -712,4 +676,3 @@
           1. Verify NLB HTTPS with a trusted client certificate.
           2. Keep {{ authentik_domain }} pointing to {{ nlb_dns_name }} and TCP 80 reachable for renewal.
           3. Open https://{{ authentik_domain }}/if/flow/cert-onboarding/ with client cert.
-          4. Follow SETUP.md for legacy ALB removal after DNS cutover.

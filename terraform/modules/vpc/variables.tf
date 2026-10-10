@@ -17,7 +17,7 @@ variable "vpc_cidr" {
 variable "allowed_cidrs" {
   type        = list(string)
   default     = ["0.0.0.0/0"]
-  description = "CIDRs allowed to reach ALB and RADIUS (allowed network)"
+  description = "CIDRs allowed by the RADIUS security group"
 }
 
 variable "tags" {
