@@ -1,0 +1,66 @@
+worker_processes auto;
+pid /tmp/nginx.pid;
+error_log /dev/stderr warn;
+events { worker_connections 1024; }
+http {
+    access_log /dev/stdout;
+    client_body_temp_path /tmp/client_body;
+    proxy_temp_path /tmp/proxy;
+    fastcgi_temp_path /tmp/fastcgi;
+    uwsgi_temp_path /tmp/uwsgi;
+    scgi_temp_path /tmp/scgi;
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        '' close;
+    }
+    # Trust the NLB's PROXY protocol only from this VPC. The existing NLB has
+    # no security group, so public source restrictions are enforced below.
+    set_real_ip_from {{ vpc_cidr }};
+    real_ip_header proxy_protocol;
+    server {
+        listen 8080;
+        location = /healthz { access_log off; return 200 "ok\n"; }
+        location / { return 404; }
+    }
+    server {
+        listen 8443 ssl proxy_protocol;
+        server_name {{ authentik_domain }};
+        ssl_certificate /etc/nginx/tls/tls.crt;
+        ssl_certificate_key /etc/nginx/tls/tls.key;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_client_certificate /etc/nginx/client-ca/ca.crt;
+        ssl_verify_client on;
+        ssl_verify_depth 4;
+        # Revalidate the certificate on each new TLS connection after CA changes.
+        ssl_session_cache off;
+        ssl_session_tickets off;
+{% for cidr in allowed_cidrs_json | from_json %}
+        allow {{ cidr }};
+{% endfor %}
+        deny all;
+        client_max_body_size 20m;
+        location / {
+            proxy_pass http://authentik-server.{{ authentik_namespace }}.svc.cluster.local:80;
+            proxy_http_version 1.1;
+            proxy_set_header Host {{ authentik_domain }};
+            proxy_set_header X-Forwarded-Host {{ authentik_domain }};
+            proxy_set_header X-Forwarded-Proto https;
+            proxy_set_header X-Forwarded-Port 443;
+            proxy_set_header X-Forwarded-For $remote_addr;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header Forwarded "";
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_read_timeout 300s;
+            # Overwrite client-supplied identity headers. Retain the ALB leaf
+            # header name during migration; the flow parses the actual X.509.
+            proxy_set_header X-Amzn-Mtls-Clientcert-Leaf $ssl_client_escaped_cert;
+            proxy_set_header X-Amzn-Mtls-Clientcert-Subject $ssl_client_s_dn;
+            proxy_set_header X-Amzn-Mtls-Clientcert-Issuer $ssl_client_i_dn;
+            proxy_set_header X-Amzn-Mtls-Clientcert-Serial-Number $ssl_client_serial;
+            proxy_set_header X-Amzn-Mtls-Clientcert "";
+            proxy_set_header X-Amzn-Mtls-Clientcert-Sans "";
+            proxy_set_header X-Amzn-Mtls-Clientcert-Validity "";
+        }
+    }
+}

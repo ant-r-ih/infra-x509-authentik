@@ -1,0 +1,107 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: authentik-edge
+  namespace: {{ ingress_namespace }}
+spec:
+  replicas: {{ nginx_replicas }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels: {app: authentik-edge}
+  template:
+    metadata:
+      labels: {app: authentik-edge}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        fsGroup: 101
+        seccompProfile: {type: RuntimeDefault}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: {app: authentik-edge}
+      containers:
+        - name: nginx
+          image: {{ nginx_image | to_json }}
+          command: [/bin/sh, /opt/edge/run.sh]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          ports:
+            - {name: https, containerPort: 8443}
+            - {name: health, containerPort: 8080}
+          readinessProbe:
+            httpGet: {path: /healthz, port: health}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: health}
+            initialDelaySeconds: 10
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+          volumeMounts:
+            - {name: config, mountPath: /etc/edge, readOnly: true}
+            - {name: script, mountPath: /opt/edge, readOnly: true}
+            - {name: tls, mountPath: /etc/nginx/tls, readOnly: true}
+            - {name: client-ca, mountPath: /etc/nginx/client-ca, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: config
+          configMap: {name: authentik-edge-config}
+        - name: script
+          configMap: {name: authentik-edge-script}
+        - name: tls
+          secret: {secretName: authentik-web-tls}
+        - name: client-ca
+          configMap: {name: authentik-client-ca}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: authentik-edge
+  namespace: {{ ingress_namespace }}
+spec:
+  type: ClusterIP
+  selector: {app: authentik-edge}
+  ports:
+    - {name: https, port: 443, targetPort: https}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: authentik-edge
+  namespace: {{ ingress_namespace }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {app: authentik-edge}
+---
+apiVersion: elbv2.k8s.aws/v1beta1
+kind: TargetGroupBinding
+metadata:
+  name: authentik-edge
+  namespace: {{ ingress_namespace }}
+spec:
+  serviceRef: {name: authentik-edge, port: 443}
+  targetGroupARN: {{ nlb_target_group_arn | to_json }}
+  targetType: ip
+  networking:
+    ingress:
+      - from:
+          - ipBlock: {cidr: {{ vpc_cidr | to_json }}}
+        ports:
+          - {protocol: TCP, port: 8443}

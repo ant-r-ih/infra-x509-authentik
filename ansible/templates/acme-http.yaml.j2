@@ -1,0 +1,15 @@
+apiVersion: elbv2.k8s.aws/v1beta1
+kind: TargetGroupBinding
+metadata:
+  name: acme-http
+  namespace: {{ ingress_namespace }}
+spec:
+  serviceRef: {name: acme-http, port: 80}
+  targetGroupARN: {{ nlb_http_target_group_arn | to_json }}
+  targetType: ip
+  networking:
+    ingress:
+      - from:
+          - ipBlock: {cidr: {{ vpc_cidr | to_json }}}
+        ports:
+          - {protocol: TCP, port: 8000}

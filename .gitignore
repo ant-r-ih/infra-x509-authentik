@@ -17,3 +17,8 @@ pki/ca-bundle.pem
 
 # macOS
 .DS_Store
+
+# Python local test artifacts
+__pycache__/
+*.pyc
+.venv/

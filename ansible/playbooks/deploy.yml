@@ -16,13 +16,20 @@
   vars:
     ansible_python_interpreter: "{{ ansible_playbook_python }}"
     authentik_namespace: authentik
-    ingress_namespace: ingress-nginx
+    ingress_namespace: authentik-edge
+    acme_ingress_version: "41.7.1"
+    cert_manager_version: "v1.20.4"
+    nginx_image: "nginx:1.30.4-alpine"
+    nginx_replicas: 2
+    startup_timeout: 1800
+    client_ca_bundle_path: "{{ playbook_dir }}/../../pki/ca-bundle.pem"
     authentik_version: "2026.8.3"
     cnpg_version: "1.24.0"
     enrollment_enabled: true
 
   tasks:
     - name: Assert all required Terraform variables are present
+      tags: [acme-http]
       assert:
         that:
           - cluster_name is defined
@@ -34,12 +41,18 @@
           - authentik_bootstrap_password is defined
           - authentik_bootstrap_email is defined
           - authentik_api_token is defined
-          - alb_target_group_arn is defined
+          - nlb_target_group_arn is defined
+          - nlb_http_target_group_arn is defined
+          - acme_email is defined and acme_email | length > 0
+          - acme_server is defined
+          - allowed_cidrs_json is defined
+          - vpc_cidr is defined
           - albc_role_arn is defined
           - vpc_id is defined
         fail_msg: "Required Terraform output(s) missing — run 'terraform apply' first."
 
     - name: Update kubeconfig
+      tags: [acme-http]
       command: >
         aws eks update-kubeconfig
         --name {{ cluster_name }}
@@ -48,6 +61,7 @@
 
     # ── Namespaces ──────────────────────────────────────────────────
     - name: Create namespaces
+      tags: [acme-http]
       kubernetes.core.k8s:
         state: present
         definition:
@@ -102,11 +116,13 @@
     # Terraform outputs are injected via cloud.terraform.terraform_provider inventory.
     # Access as hostvars['localhost']['<output_name>'].
     - name: Add eks-charts Helm repo
+      tags: [acme-http]
       kubernetes.core.helm_repository:
         name: eks
         repo_url: https://aws.github.io/eks-charts
 
     - name: Install AWS Load Balancer Controller
+      tags: [acme-http]
       kubernetes.core.helm:
         name: aws-load-balancer-controller
         chart_ref: eks/aws-load-balancer-controller
@@ -130,36 +146,88 @@
               memory: 256Mi
 
     - name: Wait for AWS Load Balancer Controller
+      tags: [acme-http]
       command: >
         kubectl wait deployment/aws-load-balancer-controller
         --for=condition=Available --timeout=120s -n kube-system
       changed_when: false
 
-    # ── nginx Ingress Controller ────────────────────────────────────
-    - name: Add ingress-nginx Helm repo
+    # Bootstrap HTTP independently of the TLS Secret and nginx startup.
+    - name: Add Traefik Helm repo
       kubernetes.core.helm_repository:
-        name: ingress-nginx
-        repo_url: https://kubernetes.github.io/ingress-nginx
+        name: traefik
+        repo_url: https://traefik.github.io/charts
+      tags: [acme-http]
 
-    - name: Apply njs ConfigMaps
+    - name: Install HTTP01-only ingress controller
+      kubernetes.core.helm:
+        name: acme-http
+        chart_ref: traefik/traefik
+        chart_version: "{{ acme_ingress_version }}"
+        release_namespace: "{{ ingress_namespace }}"
+        wait: true
+        wait_timeout: "{{ startup_timeout }}s"
+        values_files:
+          - "{{ playbook_dir }}/../../kubernetes/nginx/acme-http-values.yaml"
+        values:
+          providers:
+            kubernetesIngress:
+              namespaces: ["{{ ingress_namespace }}"]
+      tags: [acme-http]
+
+    - name: Bind HTTP01 controller to NLB port 80
       kubernetes.core.k8s:
         state: present
-        src: "{{ playbook_dir }}/../../kubernetes/ingress/njs-cert-parse-configmap.yaml"
+        definition: "{{ lookup('template', playbook_dir + '/../templates/acme-http.yaml.j2') | from_yaml }}"
+      tags: [acme-http]
 
-    - name: Install nginx Ingress
+    # HTTP01 requires public DNS to point to this NLB before issuance.
+    - name: Install cert-manager
       kubernetes.core.helm:
-        name: ingress-nginx
-        chart_ref: ingress-nginx/ingress-nginx
-        release_namespace: "{{ ingress_namespace }}"
-        create_namespace: false
-        values_files:
-          - "{{ playbook_dir }}/../../kubernetes/ingress/nginx-values.yaml"
+        name: cert-manager
+        chart_ref: oci://quay.io/jetstack/charts/cert-manager
+        chart_version: "{{ cert_manager_version }}"
+        release_namespace: cert-manager
+        create_namespace: true
+        wait: true
+        wait_timeout: "{{ startup_timeout }}s"
+        values:
+          crds:
+            enabled: true
+
+    - name: Configure HTTP01 issuer and server certificate
+      kubernetes.core.k8s:
+        state: present
+        definition: "{{ lookup('template', playbook_dir + '/../templates/certificate.yaml.j2') | from_yaml_all | list }}"
+
+    - name: Wait for the server certificate
+      command: >
+        kubectl wait certificate/authentik-web
+        --for=condition=Ready --timeout={{ startup_timeout }}s -n {{ ingress_namespace }}
+      changed_when: false
 
     # ── Authentik ───────────────────────────────────────────────────
     - name: Add Authentik Helm repo
       kubernetes.core.helm_repository:
         name: authentik
         repo_url: https://charts.goauthentik.io
+
+    # ── Authentik Blueprints ────────────────────────────────────────
+    # The ConfigMap is mounted at /blueprints/mounted/cm-authentik-blueprints/
+    # The worker applies blueprints inline via Celery on startup — no subprocess, no OOM.
+    - name: Create authentik-blueprints ConfigMap
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: authentik-blueprints
+            namespace: "{{ authentik_namespace }}"
+          data:
+            onboarding-flow.yaml: "{{ lookup('file', playbook_dir + '/../../kubernetes/authentik/blueprints/onboarding-flow.yaml') }}"
+            credential-enrollment-flow.yaml: "{{ lookup('file', playbook_dir + '/../../kubernetes/authentik/blueprints/credential-enrollment-flow.yaml') }}"
+            radius-outpost.yaml: "{{ lookup('file', playbook_dir + '/../../kubernetes/authentik/blueprints/radius-outpost.yaml') }}"
 
     - name: Install Authentik
       kubernetes.core.helm:
@@ -184,22 +252,46 @@
     - name: Wait for Authentik server
       command: >
         kubectl wait deployment/authentik-server
-        --for=condition=Available --timeout=300s -n {{ authentik_namespace }}
+        --for=condition=Available --timeout={{ startup_timeout }}s -n {{ authentik_namespace }}
       changed_when: false
 
-    # ── Apply Ingress ────────────────────────────────────────────────
-    - name: Wait for nginx Ingress controller to be ready
-      command: >
-        kubectl wait deployment/ingress-nginx-controller
-        --for=condition=Available --timeout=120s -n {{ ingress_namespace }}
-      changed_when: false
-
-    - name: Apply Authentik nginx Ingress
+    # Normal nginx Deployment, not the retired community ingress-nginx chart.
+    - name: Configure nginx and trusted client CA
       kubernetes.core.k8s:
         state: present
-        src: "{{ playbook_dir }}/../../kubernetes/ingress/authentik-ingress.yaml"
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: "{{ item.name }}"
+            namespace: "{{ ingress_namespace }}"
+          data: "{{ item.data }}"
+      loop:
+        - name: authentik-edge-config
+          data:
+            nginx.conf: "{{ lookup('template', playbook_dir + '/../templates/nginx.conf.j2') }}"
+        - name: authentik-edge-script
+          data:
+            run.sh: "{{ lookup('file', playbook_dir + '/../../kubernetes/nginx/run.sh') }}"
+        - name: authentik-client-ca
+          data:
+            ca.crt: "{{ lookup('file', client_ca_bundle_path) }}"
+      loop_control:
+        label: "{{ item.name }}"
 
-    - name: Bind ALB target group to authentik-server via TargetGroupBinding
+    - name: Deploy nginx and bind NLB targets
+      kubernetes.core.k8s:
+        state: present
+        definition: "{{ lookup('template', playbook_dir + '/../templates/nginx.yaml.j2') | from_yaml_all | list }}"
+
+    - name: Wait for nginx rollout
+      command: >
+        kubectl rollout status deployment/authentik-edge
+        --timeout={{ startup_timeout }}s -n {{ ingress_namespace }}
+      changed_when: false
+
+    # Leave the old binding in place until DNS has been migrated.
+    - name: Retain legacy ALB target binding during migration
       kubernetes.core.k8s:
         state: present
         definition:
@@ -214,23 +306,7 @@
               port: 80
             targetGroupARN: "{{ alb_target_group_arn }}"
             targetType: ip
-
-    # ── Authentik Blueprints ────────────────────────────────────────
-    # The ConfigMap is mounted at /blueprints/mounted/cm-authentik-blueprints/
-    # The worker applies blueprints inline via Celery on startup — no subprocess, no OOM.
-    - name: Create authentik-blueprints ConfigMap
-      kubernetes.core.k8s:
-        state: present
-        definition:
-          apiVersion: v1
-          kind: ConfigMap
-          metadata:
-            name: authentik-blueprints
-            namespace: "{{ authentik_namespace }}"
-          data:
-            onboarding-flow.yaml: "{{ lookup('file', playbook_dir + '/../../kubernetes/authentik/blueprints/onboarding-flow.yaml') }}"
-            credential-enrollment-flow.yaml: "{{ lookup('file', playbook_dir + '/../../kubernetes/authentik/blueprints/credential-enrollment-flow.yaml') }}"
-            radius-outpost.yaml: "{{ lookup('file', playbook_dir + '/../../kubernetes/authentik/blueprints/radius-outpost.yaml') }}"
+      when: retain_legacy_alb | default(false) | bool
 
     - name: Restart authentik-worker to apply mounted blueprints
       kubernetes.core.k8s:
@@ -253,7 +329,7 @@
 
     # ── REST API configuration (no kubectl exec shell — avoids OOM in worker pod) ──
     # Authentik bootstrap_token is passed to Helm; worker creates it on startup.
-    # All API calls go through kubectl port-forward (bypasses ALB mTLS requirement).
+    # All API calls go through kubectl port-forward (bypasses the public mTLS entry point).
 
     - name: Kill any existing port-forward on port 19000
       shell: pkill -f "kubectl port-forward.*19000" || true
@@ -633,10 +709,7 @@
           Deployment complete.
 
           Next steps:
-          1. Update authentik-ingress.yaml: replace 'auth.YOURDOMAIN' with your FQDN
-          2. Create DNS CNAME: auth.yourdomain -> ALB DNS (from terraform output alb_dns_name)
-          3. Set Authentik admin password:
-               kubectl exec -n {{ authentik_namespace }} deploy/authentik-worker -- \
-                 ak create_admin_group
-          4. Open https://auth.yourdomain/if/flow/cert-onboarding/ with client cert
-          5. Then visit https://auth.yourdomain/if/flow/credential-enrollment/ to set password/OTP/passkey
+          1. Verify NLB HTTPS with a trusted client certificate.
+          2. Keep {{ authentik_domain }} pointing to {{ nlb_dns_name }} and TCP 80 reachable for renewal.
+          3. Open https://{{ authentik_domain }}/if/flow/cert-onboarding/ with client cert.
+          4. Follow SETUP.md for legacy ALB removal after DNS cutover.

@@ -1,0 +1,39 @@
+# Dedicated HTTP01 ingress; HTTPS/mTLS remains on the standalone nginx.
+fullnameOverride: acme-http
+deployment:
+  replicas: 2
+ingressClass:
+  enabled: true
+  isDefaultClass: false
+  name: acme-http
+providers:
+  kubernetesCRD:
+    enabled: false
+  kubernetesIngress:
+    enabled: true
+    ingressClass: acme-http
+    publishedService:
+      enabled: false
+  kubernetesGateway:
+    enabled: false
+gateway:
+  enabled: false
+ingressRoute:
+  dashboard:
+    enabled: false
+ports:
+  web:
+    port: 8000
+    exposedPort: 80
+  websecure:
+    expose:
+      default: false
+service:
+  spec:
+    type: ClusterIP
+resources:
+  requests: {cpu: 50m, memory: 64Mi}
+  limits: {cpu: 250m, memory: 128Mi}
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1

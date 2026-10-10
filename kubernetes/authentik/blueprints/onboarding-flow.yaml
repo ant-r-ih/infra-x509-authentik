@@ -1,7 +1,7 @@
 # Authentik Blueprint: Certificate-based Onboarding Flow
 #
 # Flow: user hits /flows/enroll/cert-onboarding/ with client cert
-# ALB mTLS passes X-Amzn-Mtls-Clientcert-Subject (URL-encoded RFC 4514 DN)
+# nginx (or legacy ALB) passes X-Amzn-Mtls-Clientcert-Leaf (URL-encoded PEM)
 # Example decoded: C=JP,O=client CA,CN=1234 Alice Example 01,emailAddress=user@example.org
 #
 # Design notes for Authentik 2026.x:
@@ -50,22 +50,25 @@ entries:
       name: cert-onboarding-lookup-policy
       expression: |
         from urllib.parse import unquote
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
         from authentik.core.models import User
 
-        raw = request.http_request.META.get("HTTP_X_AMZN_MTLS_CLIENTCERT_SUBJECT", "")
+        raw = request.http_request.META.get("HTTP_X_AMZN_MTLS_CLIENTCERT_LEAF", "")
         if not raw:
             ak_logger.warning("cert-onboarding: no client certificate presented")
             return False
 
-        dn = unquote(raw.replace("+", " "))
-        fields = {}
-        for part in dn.split(","):
-            part = part.strip()
-            if "=" in part:
-                k, _, v = part.partition("=")
-                fields[k.strip().lower()] = v.strip()
-
-        cn = fields.get("cn", "")
+        # Trust only a header overwritten by our TLS-terminating proxy.
+        # unquote (not unquote_plus): '+' is valid in PEM base64.
+        try:
+            cert = x509.load_pem_x509_certificate(unquote(raw).encode("ascii"))
+            names = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+            if len(names) != 1:
+                return False
+            cn = names[0].value
+        except (ValueError, TypeError, UnicodeError):
+            return False
         tokens = cn.split() if cn else []
         if not tokens or not tokens[0].isdigit():
             ak_logger.warning("cert-onboarding: invalid CN: %s", cn)
@@ -96,6 +99,8 @@ entries:
       name: cert-onboarding-create-policy
       expression: |
         from urllib.parse import unquote
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
         from authentik.core.models import User, Group
 
         plan = request.context.get("flow_plan")
@@ -106,27 +111,29 @@ entries:
         if plan.context.get("pending_user"):
             return True
 
-        raw = request.http_request.META.get("HTTP_X_AMZN_MTLS_CLIENTCERT_SUBJECT", "")
+        raw = request.http_request.META.get("HTTP_X_AMZN_MTLS_CLIENTCERT_LEAF", "")
         if not raw:
             return False
 
-        dn = unquote(raw.replace("+", " "))
-        fields = {}
-        for part in dn.split(","):
-            part = part.strip()
-            if "=" in part:
-                k, _, v = part.partition("=")
-                fields[k.strip().lower()] = v.strip()
-
-        cn = fields.get("cn", "")
+        # Trust only a header overwritten by our TLS-terminating proxy.
+        # unquote (not unquote_plus): '+' is valid in PEM base64.
+        try:
+            cert = x509.load_pem_x509_certificate(unquote(raw).encode("ascii"))
+            names = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+            if len(names) != 1:
+                return False
+            cn = names[0].value
+        except (ValueError, TypeError, UnicodeError):
+            return False
         tokens = cn.split() if cn else []
         if not tokens or not tokens[0].isdigit():
             return False
 
         username = tokens[0]
-        name_tokens = [t for t in tokens[1:] if not (t.isdigit() and t == tokens[-1])]
+        name_tokens = tokens[1:-1] if len(tokens) > 1 and tokens[-1].isdigit() else tokens[1:]
         full_name = " ".join(name_tokens)
-        email = fields.get("emailaddress", "")
+        emails = cert.subject.get_attributes_for_oid(NameOID.EMAIL_ADDRESS)
+        email = emails[0].value if emails else ""
 
         user, created = User.objects.get_or_create(
             username=username,

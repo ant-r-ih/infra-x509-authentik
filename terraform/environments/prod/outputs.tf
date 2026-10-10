@@ -6,25 +6,21 @@ output "eks_cluster_endpoint" {
   value = module.eks.cluster_endpoint
 }
 
-output "acm_validation_cname" {
-  description = "Add this CNAME record in the example.org Route 53 zone (other account) to validate the ACM certificate"
-  value = {
-    for dvo in aws_acm_certificate.main.domain_validation_options : dvo.domain_name => {
-      name  = dvo.resource_record_name
-      type  = dvo.resource_record_type
-      value = dvo.resource_record_value
-    }
-  }
+output "nlb_dns_name" {
+  value       = aws_lb.radius.dns_name
+  description = "Web DNS CNAME target; TCP 443 terminates at nginx"
 }
 
-output "alb_dns_name" {
-  value       = aws_lb.main.dns_name
-  description = "Point your DNS CNAME (auth.example.org) to this after certificate is issued"
+output "nlb_target_group_arn" {
+  value = aws_lb_target_group.nginx_https.arn
 }
 
-output "alb_target_group_arn" {
-  value       = aws_lb_target_group.https.arn
-  description = "ARN of the ALB target group; used by TargetGroupBinding in Ansible"
+output "legacy_alb_dns_name" {
+  value = var.retain_legacy_alb ? aws_lb.main[0].dns_name : null
+}
+
+output "nlb_http_target_group_arn" {
+  value = aws_lb_target_group.acme_http.arn
 }
 
 output "radius_target_group_arn" {

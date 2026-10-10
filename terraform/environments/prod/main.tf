@@ -110,123 +110,15 @@ resource "aws_eks_addon" "ebs_csi" {
   depends_on               = [module.eks]
 }
 
-# S3 bucket for ALB Trust Store CA bundle
-resource "aws_s3_bucket" "assets" {
-  bucket = var.ca_bundle_s3_bucket
-}
-
-resource "aws_s3_bucket_versioning" "assets" {
-  bucket = aws_s3_bucket.assets.id
-  versioning_configuration {
-    status = "Enabled"
-  }
-}
-
-resource "aws_s3_bucket_public_access_block" "assets" {
-  bucket                  = aws_s3_bucket.assets.id
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-# Upload CA bundle from repo — Terraform manages the S3 object directly
-resource "aws_s3_object" "ca_bundle" {
-  bucket = aws_s3_bucket.assets.id
-  key    = var.ca_bundle_s3_key
-  source = "${path.module}/../../../pki/ca-bundle.pem"
-  etag   = filemd5("${path.module}/../../../pki/ca-bundle.pem")
-}
-
-# ALB Trust Store reads from S3; depends on the object existing
-resource "aws_lb_trust_store" "client_ca" {
-  name                             = "${var.cluster_name}-client-ca"
-  ca_certificates_bundle_s3_bucket = aws_s3_bucket.assets.id
-  ca_certificates_bundle_s3_key    = aws_s3_object.ca_bundle.key
-
-  depends_on = [aws_s3_object.ca_bundle]
-}
-
-# ACM certificate for ALB — DNS validation (cross-account Route 53).
-# After apply, run: terraform output acm_validation_cname
-# and add the printed CNAME record in the example.org Route 53 hosted zone
-# (separate AWS account). Certificate becomes ISSUED within ~5 minutes.
-resource "aws_acm_certificate" "main" {
-  domain_name       = var.authentik_domain
-  validation_method = "DNS"
-
-  lifecycle {
-    create_before_destroy = true
-  }
-}
-
-# Wait for the certificate to be issued (requires the CNAME to be in DNS first)
-resource "aws_acm_certificate_validation" "main" {
-  certificate_arn = aws_acm_certificate.main.arn
-  # validation_record_fqdns intentionally omitted:
-  # we cannot manage the external Route 53 zone from this account.
-  # Terraform will wait (up to ~45 min) for ACM to detect the DNS record.
-  timeouts {
-    create = "45m"
-  }
-}
-
-# ALB with mTLS for client certificate authentication
-resource "aws_lb" "main" {
-  name               = "${var.cluster_name}-alb"
-  internal           = false
-  load_balancer_type = "application"
-  security_groups    = [module.vpc.alb_sg_id]
-  subnets            = module.vpc.public_subnet_ids
-
-  tags = { Name = "${var.cluster_name}-alb" }
-}
-
-resource "aws_lb_target_group" "https" {
-  name        = "${var.cluster_name}-https"
-  port        = 9000
-  protocol    = "HTTP"
-  vpc_id      = module.vpc.vpc_id
-  target_type = "ip"
-
-  health_check {
-    path                = "/-/health/live/"
-    protocol            = "HTTP"
-    port                = "9000"
-    matcher             = "200"
-    healthy_threshold   = 2
-    unhealthy_threshold = 3
-  }
-}
-
-resource "aws_lb_listener" "https" {
-  load_balancer_arn = aws_lb.main.arn
-  port              = 443
-  protocol          = "HTTPS"
-  ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
-  certificate_arn   = aws_acm_certificate_validation.main.certificate_arn
-
-  # mTLS: verify client certificate against client CA
-  mutual_authentication {
-    mode                             = "verify"
-    trust_store_arn                  = aws_lb_trust_store.client_ca.arn
-    ignore_client_certificate_expiry = false
-  }
-
-  default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.https.arn
-  }
-}
-
 # RADIUS NLB (UDP, for FreeRADIUS/Authentik RADIUS outpost)
 resource "aws_lb" "radius" {
-  name               = "${var.cluster_name}-radius"
-  internal           = false
-  load_balancer_type = "network"
-  subnets            = module.vpc.public_subnet_ids
+  name                             = "${var.cluster_name}-radius"
+  internal                         = false
+  load_balancer_type               = "network"
+  subnets                          = module.vpc.public_subnet_ids
+  enable_cross_zone_load_balancing = true
 
-  tags = { Name = "${var.cluster_name}-radius-nlb" }
+  tags = { Name = "${var.cluster_name}-shared-nlb" }
 }
 
 resource "aws_lb_target_group" "radius_auth" {
@@ -250,6 +142,36 @@ resource "aws_lb_listener" "radius_auth" {
   default_action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.radius_auth.arn
+  }
+}
+
+# Share the existing NLB with RADIUS. Keep its resource identity and DNS name.
+resource "aws_lb_target_group" "nginx_https" {
+  name_prefix          = "web-"
+  port                 = 8443
+  protocol             = "TCP"
+  vpc_id               = module.vpc.vpc_id
+  target_type          = "ip"
+  proxy_protocol_v2    = true
+  preserve_client_ip   = false
+  deregistration_delay = 30
+
+  # HTTP health probes would also receive a PROXY header. Kubernetes separately
+  # checks nginx's HTTP readiness endpoint; NLB only checks its TLS socket.
+  health_check {
+    protocol = "TCP"
+    port     = "traffic-port"
+  }
+  lifecycle { create_before_destroy = true }
+}
+
+resource "aws_lb_listener" "nginx_https" {
+  load_balancer_arn = aws_lb.radius.arn
+  port              = 443
+  protocol          = "TCP"
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.nginx_https.arn
   }
 }
 
@@ -281,12 +203,20 @@ resource "ansible_host" "deploy" {
   variables = {
     ansible_connection = "local"
 
-    cluster_name              = var.cluster_name
-    aws_region                = var.aws_region
-    aws_profile               = var.aws_profile
-    authentik_domain          = var.authentik_domain
+    cluster_name     = var.cluster_name
+    aws_region       = var.aws_region
+    aws_profile      = var.aws_profile
+    authentik_domain = var.authentik_domain
 
-    alb_target_group_arn      = aws_lb_target_group.https.arn
+    alb_target_group_arn      = var.retain_legacy_alb ? aws_lb_target_group.https[0].arn : ""
+    retain_legacy_alb         = tostring(var.retain_legacy_alb)
+    nlb_target_group_arn      = aws_lb_target_group.nginx_https.arn
+    nlb_http_target_group_arn = aws_lb_target_group.acme_http.arn
+    nlb_dns_name              = aws_lb.radius.dns_name
+    acme_email                = var.acme_email
+    acme_server               = var.acme_server
+    vpc_cidr                  = var.vpc_cidr
+    allowed_cidrs_json        = jsonencode(var.allowed_cidrs)
     albc_role_arn             = aws_iam_role.albc.arn
     vpc_id                    = module.vpc.vpc_id
 
@@ -298,3 +228,29 @@ resource "ansible_host" "deploy" {
   }
 }
 
+
+# HTTP01 only. No PROXY header: ACME solver Ingress receives plain HTTP.
+resource "aws_lb_target_group" "acme_http" {
+  name_prefix          = "acme-"
+  port                 = 8000
+  protocol             = "TCP"
+  vpc_id               = module.vpc.vpc_id
+  target_type          = "ip"
+  preserve_client_ip   = false
+  deregistration_delay = 30
+  health_check {
+    protocol = "TCP"
+    port     = "traffic-port"
+  }
+  lifecycle { create_before_destroy = true }
+}
+
+resource "aws_lb_listener" "acme_http" {
+  load_balancer_arn = aws_lb.radius.arn
+  port              = 80
+  protocol          = "TCP"
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.acme_http.arn
+  }
+}

@@ -1,74 +1,39 @@
-% infra-x509-authentik
-% Infrastructure Team
-% 2026-10-02
-%% AI: Claude Sonnet 4.6 (33%)
-
 # x509-authentik
 
-Authenticate client CA members via X.509 client certificates into
-[Authentik](https://goauthentik.io/) on AWS EKS — no passwords at enrollment,
-just present your X.509 client certificate.
+Private-CA client certificates enroll members into Authentik on AWS EKS.
+The certificate CN `1234 Alice Example 01` supplies username `1234` and
+name `Alice Example`; an emailAddress RDN supplies the optional email.
 
-## How it works
-
-```
-Client browser (X.509 client certificate)
-  │
-  ▼
-AWS ALB  ──  mTLS verify against client CA trust store
-  │          adds X-Amzn-Mtls-Clientcert-Subject header
-  ▼
-nginx Ingress → Authentik (auth.example.org)
-  │
-  ▼
-/if/flow/cert-onboarding/
-  │
-  ├── ExpressionPolicy (evaluate_on_plan)
-  │     • gate: cert-create PolicyBinding enabled check
-  │     • parse CN  →  username / full name / email
-  │     • JIT-provision user, add to "cert-users" group
-  │
-  └── UserLoginStage  →  session established
+```text
+Browser with client certificate
+  → shared NLB (TCP 443; also serves RADIUS UDP 1812)
+  → nginx Deployment (TLS + mandatory mTLS, private CA verification)
+  → Authentik Service
+  → certificate onboarding → existing account or permitted JIT enrollment
 ```
 
-CN format: `1234 Alice Example 01`
-→ username `1234`, name `Alice Example`
+Server certificates are issued and renewed by **cert-manager / Let's Encrypt
+HTTP-01**. NLB port 80 reaches a dedicated Traefik controller that serves only
+cert-manager challenge Ingresses; unmatched paths return 404. No DNS API access,
+ACM certificate, or ALB is required. Port 80 must remain reachable for renewal.
+nginx reloads projected TLS/CA/config updates without terminating established
+connections. Two nginx replicas and a TargetGroupBinding let the AWS Load
+Balancer Controller track Pod IP changes. This does not install a Pod or node
+autoscaler; replica counts remain explicit.
 
-After enrollment, the member can visit `/if/flow/credential-enrollment/`
-to register a password, TOTP, or passkey for subsequent logins, and use
-the RADIUS outpost for network authentication.
+| Directory | Purpose |
+|---|---|
+| `terraform/` | VPC, EKS, shared NLB, IAM for AWS controllers |
+| `ansible/playbooks/deploy.yml` | Deploy database, Authentik, cert-manager, nginx and flow bindings |
+| `ansible/templates/` | nginx configuration, Kubernetes resources, certificate issuer |
+| `kubernetes/authentik/blueprints/` | Certificate onboarding, credentials, RADIUS |
+| `kubernetes/nginx/run.sh` | Graceful reload on certificate/CA/config rotation |
+| `tests/` | Certificate policy and local nginx integration checks |
 
-## Enrollment gate
+See [SETUP.md](SETUP.md) for deployment and **staged migration from the existing
+ALB**. `retain_legacy_alb=true` preserves the old ALB during verification and DNS
+cutover. Only disable it after completing that procedure.
 
-Enrollment is on when the cert-create PolicyBinding is enabled (see Enrollment On/Off),
-off when it is deleted. No flow changes needed. See [SETUP.md](SETUP.md) for the
-one-liner commands.
-
-## Stack
-
-| Layer | Component |
-|-------|-----------|
-| Cloud | AWS EKS (Terraform) |
-| Ingress | AWS ALB (mTLS) + nginx |
-| Identity | Authentik 2026.8.3 |
-| Database | CloudNativePG (PostgreSQL) |
-| Cache | Redis |
-
-## Repository layout
-
-```
-terraform/          Infrastructure (EKS, ALB, ACM, mTLS trust store)
-kubernetes/
-  authentik/
-    blueprints/     Authentik flow blueprints (applied by Ansible)
-    values.yaml     Helm values
-  ingress/          ALB + nginx Ingress manifests
-ansible/
-  playbooks/
-    deploy.yml      End-to-end deploy playbook
-```
-
-## Getting started
-
-See **[SETUP.md](SETUP.md)** for full deployment steps including the one manual
-step (ACM certificate DNS validation).
+This branch implements private-CA enrollment and authentication only.
+The private CA bundle is supplied locally as `pki/ca-bundle.pem`.
+JPKI linking and certificate-free login are outside this change.

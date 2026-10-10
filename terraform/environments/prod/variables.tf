@@ -21,7 +21,7 @@ variable "vpc_cidr" {
 variable "allowed_cidrs" {
   type        = list(string)
   default     = ["0.0.0.0/0"]
-  description = "allowed network — allowed to reach ALB and RADIUS"
+  description = "Client CIDRs enforced by nginx for HTTPS (RADIUS access is configured separately)"
 }
 
 variable "api_allowed_cidrs" {
@@ -57,12 +57,13 @@ variable "max_nodes" {
 
 variable "authentik_domain" {
   type        = string
-  description = "FQDN for Authentik (must have ACM cert), e.g. auth.example.org"
+  description = "FQDN for Authentik, e.g. auth.example.org"
 }
 
 variable "ca_bundle_s3_bucket" {
   type        = string
-  description = "S3 bucket holding client CA bundle PEM for ALB Trust Store"
+  default     = ""
+  description = "Legacy CA archive bucket; keep existing value during migration, omit for new installs"
 }
 
 variable "ca_bundle_s3_key" {
@@ -80,4 +81,21 @@ variable "authentik_bootstrap_password" {
   type        = string
   sensitive   = true
   description = "Password for the initial akadmin account (set by operator)"
+}
+
+variable "retain_legacy_alb" {
+  type        = bool
+  default     = false
+  description = "Set true during migration; disable only after NLB HTTPS verification and DNS cutover"
+}
+
+variable "acme_email" {
+  type        = string
+  description = "ACME account contact email"
+}
+
+variable "acme_server" {
+  type        = string
+  default     = "https://acme-v02.api.letsencrypt.org/directory"
+  description = "Use the Let's Encrypt staging directory for initial HTTP01 tests"
 }
