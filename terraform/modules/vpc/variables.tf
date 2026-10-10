@@ -14,12 +14,6 @@ variable "vpc_cidr" {
   description = "VPC CIDR block"
 }
 
-variable "allowed_cidrs" {
-  type        = list(string)
-  default     = ["0.0.0.0/0"]
-  description = "CIDRs allowed by the RADIUS security group"
-}
-
 variable "tags" {
   type    = map(string)
   default = {}

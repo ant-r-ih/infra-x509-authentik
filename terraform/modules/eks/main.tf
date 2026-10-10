@@ -89,13 +89,14 @@ resource "aws_iam_role_policy_attachment" "node_policies" {
   role       = aws_iam_role.node.name
 }
 
-# Cost-optimized: Spot instance node group
+# Graviton ARM64 Spot instance node group
 resource "aws_eks_node_group" "spot" {
   cluster_name    = aws_eks_cluster.main.name
   node_group_name = "${var.cluster_name}-spot"
   node_role_arn   = aws_iam_role.node.arn
   subnet_ids      = var.private_subnet_ids
   capacity_type   = "SPOT"
+  ami_type        = "AL2023_ARM_64_STANDARD"
 
   instance_types = var.spot_instance_types
 

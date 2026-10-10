@@ -2,6 +2,9 @@
 
 ## Architecture
 
+EKS nodes use Graviton Spot instances (`t4g.medium` / `t4g.large`) with the
+`AL2023_ARM_64_STANDARD` AMI. Any additional container images must support ARM64.
+
 Terraform manages a shared NLB with TCP 80/443 and RADIUS UDP 1812 listeners.
 Both HTTP target groups use IP targets; only HTTPS uses PROXY protocol v2.
 nginx terminates TLS/mTLS on 8443,

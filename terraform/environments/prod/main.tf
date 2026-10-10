@@ -9,11 +9,10 @@ locals {
 module "vpc" {
   source = "../../modules/vpc"
 
-  name          = var.cluster_name
-  cluster_name  = var.cluster_name
-  vpc_cidr      = var.vpc_cidr
-  allowed_cidrs = var.allowed_cidrs
-  tags          = local.common_tags
+  name         = var.cluster_name
+  cluster_name = var.cluster_name
+  vpc_cidr     = var.vpc_cidr
+  tags         = local.common_tags
 }
 
 module "eks" {
@@ -182,19 +181,16 @@ resource "aws_lb_listener" "nginx_https" {
 resource "random_password" "authentik_secret_key" {
   length  = 60
   special = false
-  lifecycle { ignore_changes = [result] }
 }
 
 resource "random_password" "authentik_pg_password" {
   length  = 32
   special = false
-  lifecycle { ignore_changes = [result] }
 }
 
 resource "random_password" "authentik_api_token" {
   length  = 60
   special = false
-  lifecycle { ignore_changes = [result] }
 }
 
 resource "ansible_host" "deploy" {

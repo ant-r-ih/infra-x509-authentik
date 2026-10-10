@@ -128,35 +128,3 @@ resource "aws_security_group" "eks_nodes" {
 
   tags = merge(var.tags, { Name = "${var.name}-eks-nodes-sg" })
 }
-
-# RADIUS SG: UDP 1812/1813 from allowed network
-resource "aws_security_group" "radius" {
-  name        = "${var.name}-radius-sg"
-  description = "RADIUS: UDP 1812/1813 from client CA"
-  vpc_id      = aws_vpc.main.id
-
-  ingress {
-    description = "RADIUS auth from client CA"
-    from_port   = 1812
-    to_port     = 1812
-    protocol    = "udp"
-    cidr_blocks = var.allowed_cidrs
-  }
-
-  ingress {
-    description = "RADIUS acct from client CA"
-    from_port   = 1813
-    to_port     = 1813
-    protocol    = "udp"
-    cidr_blocks = var.allowed_cidrs
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = merge(var.tags, { Name = "${var.name}-radius-sg" })
-}

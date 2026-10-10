@@ -4,8 +4,8 @@ variable "aws_region" {
 }
 
 variable "aws_profile" {
-  type    = string
-  default = "default"
+  type        = string
+  description = "Local AWS CLI profile for the infrastructure account"
 }
 
 variable "cluster_name" {
@@ -36,8 +36,9 @@ variable "kubernetes_version" {
 }
 
 variable "spot_instance_types" {
-  type    = list(string)
-  default = ["t3.medium", "t3a.medium", "t3.large"]
+  type        = list(string)
+  default     = ["t4g.medium", "t4g.large"]
+  description = "Graviton ARM64 Spot instance types for the AL2023 ARM64 node group"
 }
 
 variable "desired_nodes" {
