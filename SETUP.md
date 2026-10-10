@@ -27,7 +27,9 @@ registers/deregisters Pod IP targets as replicas change.
 ## Prerequisites and settings
 
 Use Terraform >= 1.7, Ansible with the collections in `ansible/requirements.yml`,
-kubectl, Helm, and AWS CLI. Commands below use AWS profile **ANT**.
+kubectl, Helm, and AWS CLI. Commands below use **infra-prod** as an example AWS profile name. Replace it
+with your locally configured profile name in both Terraform settings and commands;
+these examples do not create or rename an AWS CLI profile.
 Run Terraform commands from the repository root with `-chdir` as shown;
 run Ansible commands from `ansible/` so `ansible.cfg` and inventory paths resolve.
 
@@ -36,7 +38,7 @@ to `terraform/environments/prod/terraform.tfvars` and set the values below.
 For an existing installation, edit its current file instead of overwriting it:
 
 ```hcl
-aws_profile          = "ANT"
+aws_profile          = "infra-prod"
 authentik_domain     = "auth.example.org"
 acme_email           = "admin@example.org"
 retain_legacy_alb    = false # NEW INSTALLS ONLY; existing ALB: start with true
@@ -59,8 +61,8 @@ password and automation token; the operator supplies the bootstrap admin passwor
 
 Ansible reads host variables from Terraform state through
 `ansible/inventory/terraform.yml`. In particular, `aws_profile` is passed explicitly
-to `aws eks update-kubeconfig`; setting `AWS_PROFILE=ANT` alone does not override
-an inventory value of `ikob`. Use the correct account's existing state and match
+to `aws eks update-kubeconfig`; setting `AWS_PROFILE=infra-prod` alone does not override
+an inventory value of `infra-dev`. Use the correct account's existing state and match
 its `aws_profile` setting. Do not switch accounts by applying an existing state
 with a different profile. If using separate checkouts/backends for each account,
 ensure the inventory's `project_path` refers to that account's Terraform project.
@@ -84,14 +86,14 @@ First bootstrap the HTTP path independently of certificate issuance:
 
 ```sh
 cd ansible
-AWS_PROFILE=ANT ansible-playbook playbooks/deploy.yml --tags acme-http
+AWS_PROFILE=infra-prod ansible-playbook playbooks/deploy.yml --tags acme-http
 ```
 
 After Terraform apply and this bootstrap, ask the DNS operator to point the
 hostname at the NLB. A plain `http://<hostname>/` should return 404. Then run the
 full playbook to install/configure cert-manager, issue the certificate, and start
 nginx. The full playbook otherwise waits for Certificate Ready while DNS is wrong.
-Keep production and development Terraform states separate when using ANT and ikob.
+Keep production and development Terraform states separate when using infra-prod and infra-dev.
 
 For initial testing you may set:
 
@@ -114,9 +116,9 @@ terraform -chdir=terraform/environments/prod plan
 terraform -chdir=terraform/environments/prod apply
 cd ansible
 ansible-galaxy collection install -r requirements.yml
-AWS_PROFILE=ANT ansible-playbook playbooks/deploy.yml --tags acme-http
+AWS_PROFILE=infra-prod ansible-playbook playbooks/deploy.yml --tags acme-http
 # Point public DNS at the NLB and wait for propagation, then:
-AWS_PROFILE=ANT ansible-playbook playbooks/deploy.yml
+AWS_PROFILE=infra-prod ansible-playbook playbooks/deploy.yml
 ```
 
 Point `authentik_domain`'s DNS CNAME to Terraform's `nlb_dns_name` output before
@@ -156,7 +158,7 @@ certificate waits default to 1800 seconds (`-e startup_timeout=3600` to adjust).
    its finalizer can deregister targets while AWS resources still exist:
 
    ```sh
-   AWS_PROFILE=ANT kubectl delete targetgroupbinding authentik-server -n authentik
+   AWS_PROFILE=infra-prod kubectl delete targetgroupbinding authentik-server -n authentik
    ```
 
 6. Set `retain_legacy_alb=false`, review `terraform plan`, then apply. This removes
@@ -183,7 +185,7 @@ host variables have not changed:
 
 ```sh
 cd ansible
-AWS_PROFILE=ANT ansible-playbook playbooks/deploy.yml
+AWS_PROFILE=infra-prod ansible-playbook playbooks/deploy.yml
 ```
 
 Changes to NLB listeners, IAM, EKS, or Terraform-provided host variables require a
@@ -196,7 +198,7 @@ variables as the original run:
 
 ```sh
 cd ansible
-AWS_PROFILE=ANT ansible-playbook playbooks/deploy.yml \
+AWS_PROFILE=infra-prod ansible-playbook playbooks/deploy.yml \
   --start-at-task "Kill any existing port-forward on port 19000"
 ```
 
