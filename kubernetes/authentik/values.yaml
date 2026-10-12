@@ -15,8 +15,6 @@ authentik:
     name: authentik
     user: authentik
     password: ""  # set via secret (authentik-pg-credentials)
-  redis:
-    host: authentik-redis-master.authentik.svc.cluster.local
 
 blueprints:
   configMaps:
@@ -44,25 +42,6 @@ worker:
     limits:
       cpu: 500m
       memory: 6Gi
-
-# Redis: use Bitnami subchart (bundled)
-redis:
-  enabled: true
-  architecture: standalone
-  auth:
-    enabled: false
-  master:
-    resources:
-      requests:
-        memory: 64Mi
-        cpu: 20m
-      limits:
-        memory: 128Mi
-        cpu: 200m
-    persistence:
-      enabled: true
-      size: 1Gi
-      storageClass: gp3
 
 # PostgreSQL subchart disabled — using CloudNativePG instead
 postgresql:
