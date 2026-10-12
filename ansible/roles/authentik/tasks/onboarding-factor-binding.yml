@@ -1,0 +1,45 @@
+---
+- name: Find onboarding stage binding
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/flows/bindings/?target={{ onboarding_flow.json.results[0].pk }}&order={{ factor_binding.stage_order }}"
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+  register: factor_stage
+  changed_when: false
+
+- name: Find onboarding gate policy
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/policies/expression/?name={{ factor_binding.policy }}"
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+  register: factor_policy
+  changed_when: false
+
+- name: Require exactly one stage and policy
+  assert:
+    that:
+      - factor_stage.json.pagination.count == 1
+      - factor_policy.json.pagination.count == 1
+
+- name: Find existing onboarding policy binding
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/policies/bindings/?policy={{ factor_policy.json.results[0].pk }}"
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+  register: factor_existing
+  changed_when: false
+
+- name: Bind onboarding gate policy
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/policies/bindings/"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+    body_format: json
+    body:
+      policy: "{{ factor_policy.json.results[0].pk }}"
+      target: "{{ factor_stage.json.results[0].pk }}"
+      order: "{{ factor_binding.policy_order }}"
+      enabled: true
+    status_code: [201]
+  when: (factor_existing.json.results | selectattr('target', 'equalto', factor_stage.json.results[0].pk) | list | length) == 0

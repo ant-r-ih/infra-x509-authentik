@@ -1,0 +1,80 @@
+---
+- name: Read default login components
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/{{ item.path }}"
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+    status_code: [200]
+  loop:
+    - {path: 'stages/identification/?name=default-authentication-identification'}
+    - {path: 'stages/password/?name=default-authentication-password'}
+    - {path: 'flows/instances/?slug=default-authentication-flow'}
+    - {path: 'stages/authenticator/validate/?name=default-authentication-mfa-validation'}
+  register: login_components
+  changed_when: false
+
+- name: Require unique default login components
+  assert:
+    that:
+      - item.json.pagination.count == 1
+  loop: "{{ login_components.results }}"
+  loop_control:
+    label: "{{ item.item.path }}"
+
+- name: Select default login components
+  set_fact:
+    login_identification: "{{ login_components.results[0].json.results[0] }}"
+    login_password: "{{ login_components.results[1].json.results[0] }}"
+    login_flow: "{{ login_components.results[2].json.results[0] }}"
+    login_webauthn: "{{ login_components.results[3].json.results[0] }}"
+
+- name: Require WebAuthn support in the login validator
+  assert:
+    that:
+      - "'webauthn' in login_webauthn.device_classes"
+
+- name: Put password, passkey and certificate enrollment in the login card
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/stages/identification/{{ login_identification.pk }}/"
+    method: PATCH
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+    body_format: json
+    body:
+      user_fields: "{{ login_identification.user_fields }}"
+      password_stage: "{{ login_password.pk }}"
+      webauthn_stage: "{{ login_webauthn.pk }}"
+      enrollment_flow: "{{ onboarding_flow.json.results[0].pk }}"
+    status_code: [200]
+  when: >-
+    login_identification.password_stage != login_password.pk or
+    login_identification.webauthn_stage != login_webauthn.pk or
+    login_identification.enrollment_flow != onboarding_flow.json.results[0].pk
+
+- name: Read separate password stage bindings in the default login flow
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/flows/bindings/?target={{ login_flow.pk }}&stage={{ login_password.pk }}"
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+    status_code: [200]
+  register: login_password_bindings
+  changed_when: false
+
+# Keep the password stage itself: the identification form now executes it inline.
+- name: Remove duplicate password page from the default login flow
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/flows/bindings/{{ item.pk }}/"
+    method: DELETE
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+    status_code: [204]
+  loop: "{{ login_password_bindings.json.results }}"
+  loop_control:
+    label: "{{ item.pk }}"
+  when: item.target == login_flow.pk and item.stage == login_password.pk
+
+- name: Remove the old background onboarding link
+  import_tasks: footer-link.yml
+
+- name: Label the enrollment link as certificate access
+  import_tasks: login-branding.yml

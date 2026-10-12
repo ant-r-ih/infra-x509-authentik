@@ -1,0 +1,46 @@
+authentik:
+  secret_key: {{ authentik_secret_key | to_json }}
+  bootstrap_password: {{ authentik_bootstrap_password | to_json }}
+  bootstrap_email: {{ authentik_bootstrap_email | to_json }}
+  bootstrap_token: {{ authentik_api_token | to_json }}
+  # Certificate policies depend on each request and mutate the flow context.
+  # Do not reuse anonymous flow plans or cached policy results across requests.
+  cache:
+    timeout_flows: 0
+    timeout_policies: 0
+  postgresql:
+    host: {{ postgres_host | to_json }}
+    port: {{ postgres_port }}
+    name: {{ postgres_database | to_json }}
+    user: {{ postgres_user | to_json }}
+    password: {{ authentik_pg_password | to_json }}
+    sslmode: {{ postgres_sslmode | to_json }}
+  web:
+    base_url: {{ ('https://' + authentik_domain) | to_json }}
+global:
+  image:
+    tag: {{ authentik_version | to_json }}
+  deploymentStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+{% if media_pvc_enabled %}
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: authentik-data
+  volumeMounts:
+    - name: data
+      mountPath: /data
+  securityContext:
+    fsGroup: 1000
+{% endif %}
+server:
+  terminationGracePeriodSeconds: 60
+  lifecycle:
+    preStop:
+      exec:
+        command: [python, -c, "import time; time.sleep(10)"]
+worker:
+  terminationGracePeriodSeconds: 60

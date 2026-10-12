@@ -1,0 +1,363 @@
+---
+- name: Start kubectl port-forward to Authentik server
+  shell: >-
+    echo $$ > {{ api_forward_pid.path | quote }};
+    exec kubectl port-forward --address=127.0.0.1 -n {{ authentik_namespace }}
+    svc/authentik-server {{ api_forward_port }}:80
+  async: 3600
+  poll: 0
+  register: pf_job
+
+- name: Wait for port-forward to be ready
+  wait_for:
+    port: "{{ api_forward_port }}"
+    delay: 2
+    timeout: 30
+
+- name: Set Authentik API base URL (via port-forward)
+  set_fact:
+    authentik_api_base: "http://127.0.0.1:{{ api_forward_port }}"
+
+- name: Wait for Authentik API to accept bootstrap token
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/core/users/me/"
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+    status_code: [200]
+  register: api_ready
+  retries: 6
+  delay: 10
+  until: api_ready.status == 200
+  changed_when: false
+
+# ── Configure default brand domain (fixes "Base URL not configured" warning) ──
+- name: Get default Authentik brand
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/core/brands/?default=true"
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+    status_code: [200]
+  register: default_brand
+  changed_when: false
+
+- name: Set default brand domain
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/core/brands/{{ default_brand.json.results[0].brand_uuid }}/"
+    method: PATCH
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+    body_format: json
+    body:
+      domain: "{{ authentik_domain }}"
+    status_code: [200]
+  when: >-
+    default_brand.json.pagination.count > 0 and
+    default_brand.json.results[0].domain != authentik_domain
+
+- name: Wait for cert-onboarding flow to be applied by worker
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/flows/instances/?slug=cert-onboarding"
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+    status_code: [200]
+  register: onboarding_flow_check
+  retries: 18
+  delay: 10
+  until: onboarding_flow_check.json.pagination.count > 0
+  changed_when: false
+
+# PolicyBindings cannot be created via blueprint (two-phase UUID mismatch).
+# evaluate_on_plan=True is required so policies run during FlowPlanner.plan()
+# and can write pending_user into the live FlowPlan context.
+- name: Get cert-onboarding flow details
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/flows/instances/?slug=cert-onboarding"
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+  register: onboarding_flow
+  changed_when: false
+
+- name: Configure single-page login and certificate enrollment link
+  import_tasks: login-layout.yml
+
+- name: Get cert-onboarding FlowStageBinding at order 20
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/flows/bindings/?target={{ onboarding_flow.json.results[0].pk }}&order=20"
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+  register: fsb
+  changed_when: false
+
+- name: Set evaluate_on_plan=True on FlowStageBinding
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/flows/bindings/{{ fsb.json.results[0].pk }}/"
+    method: PATCH
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+    body_format: json
+    body:
+      evaluate_on_plan: true
+    status_code: [200]
+
+- name: Get cert-onboarding-lookup-policy
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/policies/expression/?name=cert-onboarding-lookup-policy"
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+  register: lookup_policy
+  changed_when: false
+
+- name: Check if lookup PolicyBinding already exists
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/policies/bindings/?policy={{ lookup_policy.json.results[0].pk }}&order=0"
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+  register: lookup_binding_check
+  changed_when: false
+
+- name: Create lookup PolicyBinding (order 0, always enabled)
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/policies/bindings/"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+    body_format: json
+    body:
+      policy: "{{ lookup_policy.json.results[0].pk }}"
+      target: "{{ fsb.json.results[0].pk }}"
+      order: 0
+      enabled: true
+    status_code: [201]
+  when: lookup_binding_check.json.pagination.count == 0
+
+- name: Get cert-onboarding-create-policy
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/policies/expression/?name=cert-onboarding-create-policy"
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+  register: create_policy
+  changed_when: false
+
+- name: Check if create PolicyBinding already exists
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/policies/bindings/?policy={{ create_policy.json.results[0].pk }}&order=1"
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+  register: create_binding_check
+  changed_when: false
+
+- name: Create create PolicyBinding (order 1, enrollment gate)
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/policies/bindings/"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+    body_format: json
+    body:
+      policy: "{{ create_policy.json.results[0].pk }}"
+      target: "{{ fsb.json.results[0].pk }}"
+      order: 1
+      enabled: "{{ enrollment_enabled | bool }}"
+    status_code: [201]
+  when: create_binding_check.json.pagination.count == 0
+
+- name: Update create PolicyBinding enabled state
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/policies/bindings/{{ create_binding_check.json.results[0].pk }}/"
+    method: PATCH
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+    body_format: json
+    body:
+      enabled: "{{ enrollment_enabled | bool }}"
+      policy: "{{ create_policy.json.results[0].pk }}"
+      target: "{{ create_binding_check.json.results[0].target }}"
+    status_code: [200]
+  when: create_binding_check.json.pagination.count > 0
+
+# ── New-user credential setup gate ────────────────────────────────
+# cert-onboarding-new-user-gate is bound to the password prompt FSB (order 30)
+# and user-write FSB (order 40). Both run for certificate users without a password.
+- name: Get cert-onboarding-new-user-gate policy
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/policies/expression/?name=cert-onboarding-new-user-gate"
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+  register: new_user_gate_policy
+  changed_when: false
+
+- name: Get cert-onboarding FlowStageBinding at order 30
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/flows/bindings/?target={{ onboarding_flow.json.results[0].pk }}&order=30"
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+  register: fsb30
+  changed_when: false
+  when: new_user_gate_policy.json.pagination.count > 0
+
+- name: Get cert-onboarding FlowStageBinding at order 40
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/flows/bindings/?target={{ onboarding_flow.json.results[0].pk }}&order=40"
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+  register: fsb40
+  changed_when: false
+  when: new_user_gate_policy.json.pagination.count > 0
+
+- name: Get all PolicyBindings for new-user-gate policy
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/policies/bindings/?policy={{ new_user_gate_policy.json.results[0].pk }}"
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+  register: gate_bindings_all
+  changed_when: false
+  when: >-
+    new_user_gate_policy.json.pagination.count > 0 and
+    fsb30 is defined and fsb30.json.pagination.count > 0 and
+    fsb40 is defined and fsb40.json.pagination.count > 0
+
+- name: Create new-user-gate PolicyBinding for FSB-30 (password prompt)
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/policies/bindings/"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+    body_format: json
+    body:
+      policy: "{{ new_user_gate_policy.json.results[0].pk }}"
+      target: "{{ fsb30.json.results[0].pk }}"
+      order: 0
+      enabled: true
+    status_code: [201]
+  when: >-
+    new_user_gate_policy.json.pagination.count > 0 and
+    fsb30 is defined and fsb30.json.pagination.count > 0 and
+    gate_bindings_all is defined and not (gate_bindings_all.get('skipped', false)) and
+    (gate_bindings_all.json.results | selectattr('target', 'equalto', fsb30.json.results[0].pk) | list | length) == 0
+
+- name: Create new-user-gate PolicyBinding for FSB-40 (user write)
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/policies/bindings/"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+    body_format: json
+    body:
+      policy: "{{ new_user_gate_policy.json.results[0].pk }}"
+      target: "{{ fsb40.json.results[0].pk }}"
+      order: 0
+      enabled: true
+    status_code: [201]
+  when: >-
+    new_user_gate_policy.json.pagination.count > 0 and
+    fsb40 is defined and fsb40.json.pagination.count > 0 and
+    gate_bindings_all is defined and not (gate_bindings_all.get('skipped', false)) and
+    (gate_bindings_all.json.results | selectattr('target', 'equalto', fsb40.json.results[0].pk) | list | length) == 0
+
+# Stage policies are bound via API after blueprint objects exist.
+- name: Configure optional authenticator selection and final login guards
+  include_tasks: onboarding-factor-binding.yml
+  loop:
+    - {stage_order: 50, policy: cert-onboarding-ready, policy_order: 0}
+    - {stage_order: 60, policy: cert-onboarding-ready, policy_order: 0}
+    - {stage_order: 60, policy: cert-onboarding-select-totp, policy_order: 1}
+    - {stage_order: 70, policy: cert-onboarding-ready, policy_order: 0}
+    - {stage_order: 70, policy: cert-onboarding-select-passkey, policy_order: 1}
+    - {stage_order: 80, policy: cert-onboarding-ready, policy_order: 0}
+  loop_control:
+    loop_var: factor_binding
+
+# NotificationRule: set group (authentik Admins) and enable
+- name: Get cert-enrollment-notify NotificationRule
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/events/rules/?name=cert-enrollment-notify"
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+  register: notification_rule
+  changed_when: false
+
+- name: Get authentik Admins group
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/core/groups/?name=authentik+Admins"
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+  register: admin_group
+  changed_when: false
+
+- name: Get fallback superuser group if authentik Admins not found
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/core/groups/?is_superuser=true"
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+  register: superuser_groups
+  changed_when: false
+  when: admin_group.json.pagination.count == 0
+
+- name: Enable cert-enrollment-notify rule and set group
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/events/rules/{{ notification_rule.json.results[0].pk }}/"
+    method: PATCH
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+    body_format: json
+    body:
+      enabled: true
+      group: "{{ admin_group.json.results[0].pk if admin_group.json.pagination.count > 0 else superuser_groups.json.results[0].pk }}"
+    status_code: [200]
+  when: notification_rule.json.pagination.count > 0
+
+- name: Get cert-enrollment-event-matcher policy
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/policies/expression/?name=cert-enrollment-event-matcher"
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+  register: event_matcher_policy
+  changed_when: false
+
+- name: Check if event-matcher PolicyBinding already exists
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/policies/bindings/?policy={{ event_matcher_policy.json.results[0].pk }}&order=0"
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+  register: event_matcher_binding_check
+  changed_when: false
+  when: notification_rule.json.pagination.count > 0 and event_matcher_policy.json.pagination.count > 0
+
+- name: Create event-matcher PolicyBinding for NotificationRule
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/policies/bindings/"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+    body_format: json
+    body:
+      policy: "{{ event_matcher_policy.json.results[0].pk }}"
+      target: "{{ notification_rule.json.results[0].pk }}"
+      order: 0
+      enabled: true
+    status_code: [201]
+  when: >-
+    event_matcher_binding_check is defined and
+    event_matcher_binding_check.json.pagination.count == 0
+
+# Create cert-users group for enrolled users
+- name: Check if cert-users group exists
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/core/groups/?name=cert-users"
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+  register: cert_users_group
+  changed_when: false
+
+- name: Create cert-users group
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/core/groups/"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+    body_format: json
+    body:
+      name: cert-users
+      is_superuser: false
+    status_code: [201]
+  when: cert_users_group.json.pagination.count == 0

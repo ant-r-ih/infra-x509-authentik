@@ -1,9 +1,13 @@
 worker_processes auto;
+worker_shutdown_timeout 45s;
 pid /tmp/nginx.pid;
 error_log /dev/stderr warn;
 events { worker_connections 1024; }
 http {
-    access_log /dev/stdout;
+    log_format edge '$remote_addr "$request_method $uri" status=$status '
+                    'mtls=$ssl_client_verify connection=$connection:$connection_requests '
+                    'upstream_status=$upstream_status';
+    access_log /dev/stdout edge;
     client_body_temp_path /tmp/client_body;
     proxy_temp_path /tmp/proxy;
     fastcgi_temp_path /tmp/fastcgi;
@@ -13,23 +17,26 @@ http {
         default upgrade;
         '' close;
     }
-    # Trust the NLB's PROXY protocol only from this VPC. The existing NLB has
-    # no security group, so public source restrictions are enforced below.
-    set_real_ip_from {{ vpc_cidr }};
+{% if proxy_protocol_enabled | default(false) %}
+    # Only explicitly trusted upstream proxies may supply a client address.
+{% for cidr in proxy_protocol_trusted_cidrs %}
+    set_real_ip_from {{ cidr }};
+{% endfor %}
     real_ip_header proxy_protocol;
+{% endif %}
     server {
         listen 8080;
         location = /healthz { access_log off; return 200 "ok\n"; }
         location / { return 404; }
     }
     server {
-        listen 8443 ssl proxy_protocol;
+        listen 8443 ssl{% if proxy_protocol_enabled | default(false) %} proxy_protocol{% endif %};
         server_name {{ authentik_domain }};
         ssl_certificate /etc/nginx/tls/tls.crt;
         ssl_certificate_key /etc/nginx/tls/tls.key;
         ssl_protocols TLSv1.2 TLSv1.3;
         ssl_client_certificate /etc/nginx/client-ca/ca.crt;
-        ssl_verify_client on;
+        ssl_verify_client optional;
         ssl_verify_depth 4;
         # Revalidate the certificate on each new TLS connection after CA changes.
         ssl_session_cache off;

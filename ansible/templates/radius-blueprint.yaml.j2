@@ -4,7 +4,7 @@
 # Authentik RADIUS outpost listens on UDP 1812
 #
 # The RADIUS outpost runs as a separate Deployment in the cluster,
-# exposed via the NLB created in Terraform.
+# exposed by a Kubernetes Service in native deployments.
 
 version: 1
 metadata:
@@ -99,8 +99,19 @@ entries:
       name: "RADIUS Provider"
       authorization_flow: !Find [authentik_flows.flow, [slug, radius-authentication]]
       invalidation_flow: !Find [authentik_flows.flow, [slug, radius-invalidation]]
-      shared_secret: "CHANGE_ME_RADIUS_SECRET"
-      client_networks: "0.0.0.0/0"
+      shared_secret: {{ radius_shared_secret | default('CHANGE_ME_RADIUS_SECRET') | to_json }}
+      client_networks: {{ radius_client_networks | to_json }}
+
+{% if radius_enabled %}
+  # The outpost API only exposes providers linked to an application.
+  - model: authentik_core.application
+    identifiers:
+      slug: radius
+    attrs:
+      name: RADIUS
+      slug: radius
+      provider: !Find [authentik_providers_radius.radiusprovider, [name, radius-provider]]
+{% endif %}
 
   # RADIUS Outpost
   - model: authentik_outposts.outpost
@@ -112,7 +123,7 @@ entries:
       providers:
         - !Find [authentik_providers_radius.radiusprovider, [name, radius-provider]]
       config:
-        authentik_host: "http://authentik-server.authentik.svc.cluster.local"
+        authentik_host: "http://authentik-server.{{ authentik_namespace }}.svc.cluster.local"
         authentik_host_insecure: true
         kubernetes_replicas: 1
         kubernetes_service_type: ClusterIP

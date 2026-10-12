@@ -64,10 +64,24 @@ class PolicyTests(unittest.TestCase):
             context={'flow_plan': self.plan})
         env = {'request': request, 'ak_logger': types.SimpleNamespace(warning=lambda *a: None),
                'ak_create_event': lambda *a, **kw: None}
-        body = self.expressions['cert-onboarding-' + kind + '-policy']
+        body = self.expressions.get('cert-onboarding-' + kind + '-policy',
+                                    self.expressions.get('cert-onboarding-' + kind))
         with patch.dict(sys.modules, {'authentik.core.models': self.models}):
             exec('def evaluate():\n' + textwrap.indent(body, '    '), env)
             return env['evaluate']()
+
+    def test_password_gates_require_verified_certificate_and_saved_password(self):
+        for password in ('', '!', 'hashed-password'):
+            user = types.SimpleNamespace(password=password, is_active=True,
+                has_usable_password=lambda: password != '!')
+            self.plan.context = {'pending_user': user}
+            self.assertFalse(self.run_policy('new-user-gate'))
+            self.assertFalse(self.run_policy('ready'))
+            self.plan.context['cert_verified'] = True
+            self.assertEqual(self.run_policy('new-user-gate'), password != 'hashed-password')
+            self.assertEqual(self.run_policy('ready'), password == 'hashed-password')
+        user.is_active = False
+        self.assertFalse(self.run_policy('ready'))
 
     def test_subject_header_cannot_create_user(self):
         self.assertFalse(self.run_policy('create', subject='CN=1234 Alice Example 01'))
@@ -82,6 +96,9 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(user.name, 'Alice, Example+')
         self.assertEqual(user.email, 'alice+test@example.org')
         self.assertTrue(self.plan.context['is_new_user'])
+        self.assertEqual(user.password, '!')
+        self.assertTrue(self.plan.context['cert_verified'])
+        self.assertEqual(self.plan.context['prompt_data'], {})
 
     def test_lookup_does_not_create_unknown_user(self):
         self.assertFalse(self.run_policy('lookup', certificate('1234 Alice Example 01')))

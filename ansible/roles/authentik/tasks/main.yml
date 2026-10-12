@@ -1,0 +1,340 @@
+---
+- name: Validate deployment inputs
+  tags: [always]
+  assert:
+    that:
+      - kubeconfig is defined and kubeconfig | length > 0
+      - authentik_domain is defined
+      - authentik_secret_key is defined
+      - authentik_pg_password is defined
+      - authentik_bootstrap_password is defined
+      - authentik_bootstrap_email is defined
+      - authentik_api_token is defined
+      - deployment_profile in ['native', 'aws_nlb']
+      - service_type in ['ClusterIP', 'NodePort', 'LoadBalancer']
+      - external_traffic_policy in ['Local', 'Cluster']
+      - tls_mode in ['acme', 'existing_secret']
+      - postgres_mode in ['cnpg', 'external']
+      - postgres_mode != 'cnpg' or storage_class is defined
+      - not proxy_protocol_enabled or proxy_protocol_trusted_cidrs | length > 0
+    fail_msg: "Supply an explicit kubeconfig and application settings; see SETUP.md."
+
+- name: Require an explicit RADIUS shared secret
+  assert:
+    that:
+      - radius_shared_secret is defined and radius_shared_secret | length >= 16
+      - radius_shared_secret != 'CHANGE_ME_RADIUS_SECRET'
+  when: radius_enabled | bool
+  no_log: true
+
+- name: Validate ACME inputs
+  tags: [acme-http]
+  assert:
+    that:
+      - acme_email is defined and acme_email | length > 0
+      - acme_server is defined
+  when: tls_mode == 'acme'
+
+- name: Prepare legacy AWS NLB infrastructure integration
+  import_tasks: "{{ playbook_dir }}/tasks/aws-bootstrap.yml"
+  when: deployment_profile == 'aws_nlb'
+
+# ── Namespaces ──────────────────────────────────────────────────
+- name: Create namespaces
+  tags: [acme-http]
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ item }}"
+  loop:
+    - "{{ authentik_namespace }}"
+    - "{{ ingress_namespace }}"
+
+# ── CloudNativePG Operator ──────────────────────────────────────
+- name: Install CloudNativePG operator
+  when: postgres_mode == 'cnpg'
+  kubernetes.core.k8s:
+    state: present
+    src: "https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-{{ cnpg_version.split('.')[0] }}.{{ cnpg_version.split('.')[1] }}/releases/cnpg-{{ cnpg_version }}.yaml"
+
+- name: Wait for CloudNativePG webhook
+  when: postgres_mode == 'cnpg'
+  command: >
+    kubectl wait deployment/cnpg-controller-manager
+    --for=condition=Available --timeout=120s -n cnpg-system
+  changed_when: false
+
+# ── PostgreSQL credentials ──────────────────────────────────────
+- name: Create PostgreSQL secret
+  when: postgres_mode == 'cnpg'
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: authentik-pg-credentials
+        namespace: "{{ authentik_namespace }}"
+      type: kubernetes.io/basic-auth
+      stringData:
+        username: "{{ postgres_user }}"
+        password: "{{ authentik_pg_password }}"
+  no_log: true
+
+- name: Deploy CloudNativePG cluster
+  when: postgres_mode == 'cnpg'
+  kubernetes.core.k8s:
+    state: present
+    definition: "{{ lookup('template', playbook_dir + '/../templates/postgres.yaml.j2') | from_yaml }}"
+
+# Bootstrap HTTP independently of the TLS Secret and nginx startup.
+- name: Add Traefik Helm repo
+  when: tls_mode == 'acme'
+  kubernetes.core.helm_repository:
+    name: traefik
+    repo_url: https://traefik.github.io/charts
+  tags: [acme-http]
+
+- name: Install HTTP01-only ingress controller
+  when: tls_mode == 'acme'
+  kubernetes.core.helm:
+    name: acme-http
+    chart_ref: traefik/traefik
+    chart_version: "{{ acme_ingress_version }}"
+    release_namespace: "{{ ingress_namespace }}"
+    wait: true
+    wait_timeout: "{{ startup_timeout }}s"
+    values_files:
+      - "{{ playbook_dir }}/../../kubernetes/nginx/acme-http-values.yaml"
+    values:
+      deployment:
+        replicas: "{{ nginx_replicas }}"
+      nodeSelector: "{{ edge_node_selector }}"
+      service:
+        spec: "{{ {'type': service_type} | combine({'externalTrafficPolicy': external_traffic_policy} if service_type != 'ClusterIP' else {}) }}"
+      ports:
+        web:
+          nodePort: "{{ http_node_port if service_type == 'NodePort' else None }}"
+      providers:
+        kubernetesIngress:
+          namespaces: ["{{ ingress_namespace }}"]
+  tags: [acme-http]
+
+- name: Bind HTTP01 controller to NLB port 80
+  when: deployment_profile == 'aws_nlb' and tls_mode == 'acme'
+  kubernetes.core.k8s:
+    state: present
+    definition: "{{ lookup('template', playbook_dir + '/../templates/acme-http.yaml.j2') | from_yaml }}"
+  tags: [acme-http]
+
+# HTTP01 requires public DNS and port 80 to reach the controller before issuance.
+- name: Install cert-manager
+  when: tls_mode == 'acme'
+  kubernetes.core.helm:
+    name: cert-manager
+    chart_ref: oci://quay.io/jetstack/charts/cert-manager
+    chart_version: "{{ cert_manager_version }}"
+    release_namespace: cert-manager
+    create_namespace: true
+    wait: true
+    wait_timeout: "{{ startup_timeout }}s"
+    values:
+      crds:
+        enabled: true
+
+- name: Configure HTTP01 issuer and server certificate
+  when: tls_mode == 'acme'
+  kubernetes.core.k8s:
+    state: present
+    definition: "{{ lookup('template', playbook_dir + '/../templates/certificate.yaml.j2') | from_yaml_all | list }}"
+
+- name: Wait for the server certificate
+  when: tls_mode == 'acme'
+  command: >
+    kubectl wait certificate/authentik-web
+    --for=condition=Ready --timeout={{ startup_timeout }}s -n {{ ingress_namespace }}
+  changed_when: false
+
+# ── Authentik ───────────────────────────────────────────────────
+- name: Add Authentik Helm repo
+  kubernetes.core.helm_repository:
+    name: authentik
+    repo_url: https://charts.goauthentik.io
+
+# ── Authentik Blueprints ────────────────────────────────────────
+# Blueprints include the RADIUS shared secret and are mounted from a Secret.
+# The worker applies mounted blueprints on startup.
+- name: Create authentik-blueprints Secret
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: authentik-blueprints
+        namespace: "{{ authentik_namespace }}"
+      stringData:
+        onboarding-flow.yaml: "{{ lookup('file', playbook_dir + '/../../kubernetes/authentik/blueprints/onboarding-flow.yaml') }}"
+        credential-enrollment-flow.yaml: "{{ lookup('file', playbook_dir + '/../../kubernetes/authentik/blueprints/credential-enrollment-flow.yaml') }}"
+        radius-outpost.yaml: "{{ lookup('template', playbook_dir + '/../templates/radius-blueprint.yaml.j2') }}"
+  no_log: true
+
+- name: Create shared file storage
+  kubernetes.core.k8s:
+    state: present
+    definition: "{{ lookup('template', playbook_dir + '/../templates/media-pvc.yaml.j2') | from_yaml }}"
+  when: media_pvc_enabled | bool
+
+- name: Check server TLS secret
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: authentik-web-tls
+    namespace: "{{ ingress_namespace }}"
+  register: web_tls_secret
+  no_log: true
+
+- name: Require provisioned TLS key and certificate
+  assert:
+    that:
+      - web_tls_secret.resources | length == 1
+      - "'tls.crt' in web_tls_secret.resources[0].data"
+      - "'tls.key' in web_tls_secret.resources[0].data"
+    fail_msg: "Provision authentik-web-tls before using tls_mode=existing_secret."
+  no_log: true
+
+- name: Install Authentik
+  kubernetes.core.helm:
+    name: authentik
+    chart_ref: authentik/authentik
+    chart_version: "{{ authentik_version }}"
+    release_namespace: "{{ authentik_namespace }}"
+    create_namespace: false
+    values_files:
+      - "{{ playbook_dir }}/../../kubernetes/authentik/values.yaml"
+    values: "{{ lookup('template', playbook_dir + '/../templates/authentik-values.yaml.j2') | from_yaml | combine(authentik_helm_overrides, recursive=True) }}"
+  no_log: true
+
+- name: Wait for Authentik server
+  command: >
+    kubectl rollout status deployment/authentik-server
+    --timeout={{ startup_timeout }}s -n {{ authentik_namespace }}
+  changed_when: false
+
+# Normal nginx Deployment, not the retired community ingress-nginx chart.
+- name: Configure nginx and trusted client CA
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: "{{ item.name }}"
+        namespace: "{{ ingress_namespace }}"
+      data: "{{ item.data }}"
+  loop:
+    - name: authentik-edge-config
+      data:
+        nginx.conf: "{{ lookup('template', playbook_dir + '/../templates/nginx.conf.j2') }}"
+    - name: authentik-edge-script
+      data:
+        run.sh: "{{ lookup('file', playbook_dir + '/../../kubernetes/nginx/run.sh') }}"
+    - name: authentik-client-ca
+      data:
+        ca.crt: "{{ lookup('file', client_ca_bundle_path) }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Deploy nginx and its Service
+  kubernetes.core.k8s:
+    state: present
+    definition: "{{ lookup('template', playbook_dir + '/../templates/nginx.yaml.j2') | from_yaml_all | list }}"
+
+- name: Bind nginx to legacy NLB
+  kubernetes.core.k8s:
+    state: present
+    definition: "{{ lookup('template', playbook_dir + '/../templates/aws-nginx-binding.yaml.j2') | from_yaml }}"
+  when: deployment_profile == 'aws_nlb'
+
+- name: Wait for nginx rollout
+  command: >
+    kubectl rollout status deployment/authentik-edge
+    --timeout={{ startup_timeout }}s -n {{ ingress_namespace }}
+  changed_when: false
+
+- name: Restart authentik-worker to apply mounted blueprints
+  kubernetes.core.k8s:
+    api_version: apps/v1
+    kind: Deployment
+    name: authentik-worker
+    namespace: "{{ authentik_namespace }}"
+    definition:
+      spec:
+        template:
+          metadata:
+            annotations:
+              kubectl.kubernetes.io/restartedAt: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+
+- name: Wait for authentik-worker after restart
+  command: >
+    kubectl rollout status deployment/authentik-worker
+    --timeout={{ startup_timeout }}s -n {{ authentik_namespace }}
+  changed_when: false
+
+# Apply synchronously: worker readiness does not imply blueprint task completion.
+- name: Apply mounted blueprints before configuring their API bindings
+  command: >-
+    kubectl exec -n {{ authentik_namespace }} deployment/authentik-worker --
+    ak apply_blueprint
+    /blueprints/mounted/secret-authentik-blueprints/onboarding-flow.yaml
+    /blueprints/mounted/secret-authentik-blueprints/credential-enrollment-flow.yaml
+    /blueprints/mounted/secret-authentik-blueprints/radius-outpost.yaml
+  no_log: true
+
+# ── REST API configuration ──
+# Authentik bootstrap_token is passed to Helm; worker creates it on startup.
+# All API calls go through kubectl port-forward (bypasses the public mTLS entry point).
+
+- name: Check local API forwarding port is unused
+  wait_for:
+    host: 127.0.0.1
+    port: "{{ api_forward_port }}"
+    state: stopped
+    timeout: 1
+
+- name: Allocate PID file for this deployment's port-forward
+  tempfile:
+    state: file
+    prefix: authentik-port-forward-
+  register: api_forward_pid
+
+- name: Configure application through a private local forward
+  no_log: true
+  block:
+    - name: Configure Authentik API
+      include_tasks: configure-api.yml
+    - name: Configure native RADIUS outpost
+      include_tasks: radius.yml
+      when: radius_enabled | bool
+  always:
+    - name: Stop only this deployment's port-forward
+      shell: |
+        if test -s {{ api_forward_pid.path | quote }}; then
+          kill "$(cat {{ api_forward_pid.path | quote }})" 2>/dev/null || true
+        fi
+      changed_when: false
+    - name: Remove port-forward PID file
+      file:
+        path: "{{ api_forward_pid.path }}"
+        state: absent
+
+- name: Print next steps
+  debug:
+    msg: |
+      Deployment complete ({{ deployment_profile }}).
+      Verify HTTPS through the published Service using a trusted client certificate.
+      For ACME, keep public DNS and TCP 80 routed to the HTTP01 controller.
+      Open https://{{ authentik_domain }}/if/flow/cert-onboarding/ with a client certificate.

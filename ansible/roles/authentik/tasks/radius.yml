@@ -1,0 +1,60 @@
+---
+- name: Find RADIUS outpost created by the blueprint
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/outposts/instances/?search=radius-outpost"
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+  register: radius_outpost
+  retries: 18
+  delay: 10
+  until: radius_outpost.json.results | selectattr('name', 'equalto', 'radius-outpost') | list | length == 1
+  changed_when: false
+
+- name: Select the exact RADIUS outpost
+  set_fact:
+    selected_radius_outpost: "{{ radius_outpost.json.results | selectattr('name', 'equalto', 'radius-outpost') | first }}"
+
+- name: Require manually managed RADIUS deployment
+  assert:
+    that:
+      - selected_radius_outpost.service_connection == None
+    fail_msg: "Detach the existing outpost service connection before enabling the native deployment."
+
+- name: Read RADIUS outpost token
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/core/tokens/{{ selected_radius_outpost.token_identifier }}/view_key/"
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+  register: radius_token
+  changed_when: false
+  no_log: true
+
+- name: Provision RADIUS outpost credentials
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: authentik-radius-api
+        namespace: "{{ authentik_namespace }}"
+      stringData:
+        AUTHENTIK_HOST: "http://authentik-server.{{ authentik_namespace }}.svc.cluster.local"
+        AUTHENTIK_TOKEN: "{{ radius_token.json.key }}"
+  no_log: true
+
+- name: Compute RADIUS configuration revision
+  set_fact:
+    radius_config_checksum: "{{ (lookup('template', playbook_dir + '/../templates/radius-blueprint.yaml.j2') + radius_token.json.key) | hash('sha256') }}"
+  no_log: true
+
+- name: Deploy RADIUS and its public Service
+  kubernetes.core.k8s:
+    state: present
+    definition: "{{ lookup('template', playbook_dir + '/../templates/radius.yaml.j2') | from_yaml_all | list }}"
+
+- name: Wait for RADIUS rollout
+  command: >-
+    kubectl rollout status deployment/authentik-radius
+    --timeout={{ startup_timeout }}s -n {{ authentik_namespace }}
+  changed_when: false

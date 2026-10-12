@@ -17,7 +17,7 @@ authentik:
     password: ""  # set via secret (authentik-pg-credentials)
 
 blueprints:
-  configMaps:
+  secrets:
     - authentik-blueprints
 
 server:
@@ -31,7 +31,7 @@ server:
       memory: 1Gi
 
   ingress:
-    enabled: false  # managed by our own authentik-ingress.yaml
+    enabled: false  # HTTPS is served by the standalone nginx Deployment
 
 worker:
   replicas: 1

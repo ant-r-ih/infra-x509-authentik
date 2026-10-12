@@ -1,0 +1,27 @@
+---
+- name: Read Authentik system settings
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/admin/settings/"
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+    status_code: [200]
+  register: authentik_system_settings
+  changed_when: false
+
+- name: Keep unrelated footer links
+  set_fact:
+    authentik_footer_links: >-
+      {{ (authentik_system_settings.json.footer_links | default([], true)
+          | rejectattr('href', 'equalto', '/if/flow/cert-onboarding/') | list) }}
+
+- name: Remove onboarding link from the background footer
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/admin/settings/"
+    method: PATCH
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+    body_format: json
+    body:
+      footer_links: "{{ authentik_footer_links }}"
+    status_code: [200]
+  when: authentik_system_settings.json.footer_links | default([], true) != authentik_footer_links

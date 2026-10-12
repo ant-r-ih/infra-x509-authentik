@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: authentik-data
+  namespace: {{ authentik_namespace }}
+spec:
+  accessModes: {{ media_access_modes | to_json }}
+  storageClassName: {{ media_storage_class | default(storage_class) | to_json }}
+  resources:
+    requests:
+      storage: {{ media_storage_size }}

@@ -1,0 +1,69 @@
+---
+- name: Assert all required Terraform variables are present
+  tags: [acme-http]
+  assert:
+    that:
+      - cluster_name is defined
+      - aws_region is defined
+      - aws_profile is defined
+      - nlb_target_group_arn is defined
+      - nlb_http_target_group_arn is defined
+      - vpc_cidr is defined
+      - albc_role_arn is defined
+      - vpc_id is defined
+    fail_msg: "Required Terraform output(s) missing — run 'terraform apply' first."
+
+- name: Update kubeconfig
+  tags: [acme-http]
+  command: >
+    aws eks update-kubeconfig
+    --name {{ cluster_name }}
+    --region {{ aws_region }}
+    --profile {{ aws_profile }}
+    --kubeconfig {{ kubeconfig | quote }}
+
+# ── StorageClass ────────────────────────────────────────────────
+- name: Apply gp3 StorageClass
+  kubernetes.core.k8s:
+    state: present
+    src: "{{ playbook_dir }}/../../kubernetes/cnpg/storageclass.yaml"
+
+# ── AWS Load Balancer Controller ────────────────────────────────
+# Terraform outputs are injected via cloud.terraform.terraform_provider inventory.
+# Access as hostvars['localhost']['<output_name>'].
+- name: Add eks-charts Helm repo
+  tags: [acme-http]
+  kubernetes.core.helm_repository:
+    name: eks
+    repo_url: https://aws.github.io/eks-charts
+
+- name: Install AWS Load Balancer Controller
+  tags: [acme-http]
+  kubernetes.core.helm:
+    name: aws-load-balancer-controller
+    chart_ref: eks/aws-load-balancer-controller
+    release_namespace: kube-system
+    values:
+      clusterName: "{{ cluster_name }}"
+      region: "{{ aws_region }}"
+      vpcId: "{{ vpc_id }}"
+      serviceAccount:
+        create: true
+        name: aws-load-balancer-controller
+        annotations:
+          eks.amazonaws.com/role-arn: "{{ albc_role_arn }}"
+      replicaCount: 1
+      resources:
+        requests:
+          cpu: 50m
+          memory: 128Mi
+        limits:
+          cpu: 200m
+          memory: 256Mi
+
+- name: Wait for AWS Load Balancer Controller
+  tags: [acme-http]
+  command: >
+    kubectl wait deployment/aws-load-balancer-controller
+    --for=condition=Available --timeout=120s -n kube-system
+  changed_when: false

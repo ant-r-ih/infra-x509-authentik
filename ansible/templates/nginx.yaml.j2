@@ -16,6 +16,7 @@ spec:
     metadata:
       labels: {app: authentik-edge}
     spec:
+      nodeSelector: {{ edge_node_selector | default({}) | to_json }}
       automountServiceAccountToken: false
       terminationGracePeriodSeconds: 60
       securityContext:
@@ -42,6 +43,10 @@ spec:
           ports:
             - {name: https, containerPort: 8443}
             - {name: health, containerPort: 8080}
+          lifecycle:
+            preStop:
+              exec:
+                command: [/bin/sh, -c, "sleep 10"]
           readinessProbe:
             httpGet: {path: /healthz, port: health}
             periodSeconds: 5
@@ -75,10 +80,18 @@ metadata:
   name: authentik-edge
   namespace: {{ ingress_namespace }}
 spec:
-  type: ClusterIP
+  type: {{ service_type | default('NodePort') }}
+{% if service_type | default('NodePort') != 'ClusterIP' %}
+  externalTrafficPolicy: {{ external_traffic_policy | default('Local') }}
+{% endif %}
   selector: {app: authentik-edge}
   ports:
-    - {name: https, port: 443, targetPort: https}
+    - name: https
+      port: 443
+      targetPort: https
+{% if service_type | default('NodePort') == 'NodePort' %}
+      nodePort: {{ https_node_port | default(30443) }}
+{% endif %}
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
@@ -89,19 +102,3 @@ spec:
   minAvailable: 1
   selector:
     matchLabels: {app: authentik-edge}
----
-apiVersion: elbv2.k8s.aws/v1beta1
-kind: TargetGroupBinding
-metadata:
-  name: authentik-edge
-  namespace: {{ ingress_namespace }}
-spec:
-  serviceRef: {name: authentik-edge, port: 443}
-  targetGroupARN: {{ nlb_target_group_arn | to_json }}
-  targetType: ip
-  networking:
-    ingress:
-      - from:
-          - ipBlock: {cidr: {{ vpc_cidr | to_json }}}
-        ports:
-          - {protocol: TCP, port: 8443}

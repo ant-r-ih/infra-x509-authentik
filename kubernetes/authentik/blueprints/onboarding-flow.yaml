@@ -1,6 +1,6 @@
 # Authentik Blueprint: Certificate-based Onboarding Flow
 #
-# Flow: user hits /flows/enroll/cert-onboarding/ with client cert
+# Flow: user hits /if/flow/cert-onboarding/ with client cert
 # nginx passes X-Amzn-Mtls-Clientcert-Leaf (URL-encoded PEM)
 # Example decoded: C=JP,O=client CA,CN=1234 Alice Example 01,emailAddress=user@example.org
 #
@@ -83,6 +83,8 @@ entries:
         if plan is None:
             return False
         plan.context["pending_user"] = user
+        plan.context["cert_verified"] = True
+        plan.context["prompt_data"] = {}
         return True
 
   # ── Policy B: cert-create ─────────────────────────────────────────
@@ -141,6 +143,7 @@ entries:
                 "name": full_name,
                 "email": email,
                 "is_active": True,
+                "password": "!",  # unusable until the required password stage completes
                 "attributes": {"enrollment_source": "x509"},
             },
         )
@@ -168,17 +171,18 @@ entries:
             except Exception as e:
                 ak_logger.warning("cert-onboarding: bell notification failed: %s", e)
 
-            # Flag new users so evaluate_on_plan bindings at order 30/40
-            # (optional password/write stages) are included in the plan.
+            # Keep enrollment provenance in the flow context. Password gates
+            # also cover returning users whose setup was interrupted.
             plan.context["is_new_user"] = True
 
         plan.context["pending_user"] = user
+        plan.context["cert_verified"] = True
+        plan.context["prompt_data"] = {}
         return True
 
-  # ── Policy C: new-user gate ───────────────────────────────────────
-  # Used as a PolicyBinding on orders 30 and 40 so that optional
-  # credential-setup stages only run for newly created users.
-  # PolicyBindings for these are created via Ansible (not blueprint).
+  # Keep the historic policy name so existing API bindings are updated in place.
+  # Evaluate once at planning for BOTH prompt and write; re-evaluating after
+  # saving the password would incorrectly skip the write or change the plan.
   - model: authentik_policies_expression.expressionpolicy
     identifiers:
       name: cert-onboarding-new-user-gate
@@ -186,76 +190,187 @@ entries:
       name: cert-onboarding-new-user-gate
       expression: |
         plan = request.context.get("flow_plan")
-        if plan is None:
+        if plan is None or not plan.context.get("cert_verified"):
             return False
-        return bool(plan.context.get("is_new_user", False))
+        user = plan.context.get("pending_user")
+        return bool(user and (not user.password or not user.has_usable_password()))
 
-  # ── Stage: Optional password setup (new users only) ───────────────
-  # continue_flow_without_input=True lets the user skip password setup.
+  # Used at execution time after password setup, including for existing users.
+  - model: authentik_policies_expression.expressionpolicy
+    identifiers:
+      name: cert-onboarding-ready
+    attrs:
+      name: cert-onboarding-ready
+      expression: |
+        plan = request.context.get("flow_plan")
+        if plan is None or not plan.context.get("cert_verified"):
+            return False
+        user = plan.context.get("pending_user")
+        return bool(user and user.is_active and user.password and user.has_usable_password())
+
+  - model: authentik_policies_expression.expressionpolicy
+    identifiers:
+      name: cert-onboarding-select-totp
+    attrs:
+      name: cert-onboarding-select-totp
+      expression: |
+        return request.context.get("prompt_data", {}).get("onboarding_authenticator") == "totp"
+
+  - model: authentik_policies_expression.expressionpolicy
+    identifiers:
+      name: cert-onboarding-select-passkey
+    attrs:
+      name: cert-onboarding-select-passkey
+      expression: |
+        return request.context.get("prompt_data", {}).get("onboarding_authenticator") == "passkey"
+
+  # Dedicated fields: do not change Authentik's shared password prompts.
+  - model: authentik_stages_prompt.prompt
+    identifiers:
+      name: cert-onboarding-password
+    attrs:
+      field_key: password
+      label: "パスワード"
+      type: password
+      required: true
+      order: 0
+  - model: authentik_stages_prompt.prompt
+    identifiers:
+      name: cert-onboarding-password-repeat
+    attrs:
+      field_key: password_repeat
+      label: "パスワード（確認）"
+      type: password
+      required: true
+      order: 1
   - model: authentik_stages_prompt.promptstage
     identifiers:
       name: cert-onboarding-prompt-password
     attrs:
-      name: cert-onboarding-prompt-password
-      continue_flow_without_input: true
+      continue_flow_without_input: false
       fields:
-        - !Find [authentik_stages_prompt.prompt, [field_key, password]]
-        - !Find [authentik_stages_prompt.prompt, [field_key, password_repeat]]
+        - !Find [authentik_stages_prompt.prompt, [name, cert-onboarding-password]]
+        - !Find [authentik_stages_prompt.prompt, [name, cert-onboarding-password-repeat]]
 
-  # ── Stage: User login ─────────────────────────────────────────────
-  - model: authentik_stages_user_login.userloginstage
+  - model: authentik_stages_prompt.prompt
     identifiers:
-      name: cert-onboarding-user-login
+      name: cert-onboarding-authenticator-choice
     attrs:
-      name: cert-onboarding-user-login
-      session_duration: "hours=8"
-      remember_me_offset: "days=0"
-
-  # ── Flow stage binding (evaluate_on_plan=True required) ───────────
-  # evaluate_on_plan=True: policy runs during planning so it can access
-  # flow_plan and write pending_user before UserLoginStage executes.
-  - model: authentik_flows.flowstagebinding
+      field_key: onboarding_authenticator
+      label: "MFA／Passkey の登録（任意）"
+      type: radio-button-group
+      required: true
+      order: 0
+      initial_value: passkey
+      sub_text: "今回はスキップして、後からユーザー設定で登録することもできます。"
+      placeholder_expression: true
+      placeholder: |
+        return [
+            {"label": "Passkey を登録", "value": "passkey"},
+            {"label": "認証アプリ（TOTP）を登録", "value": "totp"},
+            {"label": "今回はスキップ", "value": "skip"},
+        ]
+  - model: authentik_stages_prompt.promptstage
     identifiers:
-      target: !Find [authentik_flows.flow, [slug, cert-onboarding]]
-      order: 20
+      name: cert-onboarding-choose-authenticator
     attrs:
-      target: !Find [authentik_flows.flow, [slug, cert-onboarding]]
-      stage: !Find [authentik_stages_user_login.userloginstage, [name, cert-onboarding-user-login]]
-      order: 20
-      evaluate_on_plan: true
+      fields:
+        - !Find [authentik_stages_prompt.prompt, [name, cert-onboarding-authenticator-choice]]
 
-  # ── Flow stage binding: optional password prompt (new users, order 30) ──
-  # PolicyBinding (new-user-gate → this FSB) is created via Ansible.
-  - model: authentik_flows.flowstagebinding
+  - model: authentik_stages_authenticator_totp.authenticatortotpstage
     identifiers:
-      target: !Find [authentik_flows.flow, [slug, cert-onboarding]]
-      order: 30
+      name: cert-onboarding-totp
     attrs:
-      target: !Find [authentik_flows.flow, [slug, cert-onboarding]]
-      stage: !Find [authentik_stages_prompt.promptstage, [name, cert-onboarding-prompt-password]]
-      order: 30
-      evaluate_on_plan: true
+      friendly_name: "認証アプリ（TOTP）"
+      digits: 6
+  - model: authentik_stages_authenticator_webauthn.authenticatorwebauthnstage
+    identifiers:
+      name: cert-onboarding-passkey
+    attrs:
+      friendly_name: "Passkey"
+      user_verification: required
+      resident_key_requirement: required
 
-  # ── Stage: User write for optional password (new users only) ────────
   - model: authentik_stages_user_write.userwritestage
     identifiers:
       name: cert-onboarding-user-write
     attrs:
-      name: cert-onboarding-user-write
       user_creation_mode: never_create
+  - model: authentik_stages_user_login.userloginstage
+    identifiers:
+      name: cert-onboarding-user-login
+    attrs:
+      session_duration: "hours=8"
+      remember_me_offset: "days=0"
 
-  # ── Flow stage binding: user write for password (new users, order 40) ───
-  # Saves the password entered at order 30.
-  # PolicyBinding (new-user-gate → this FSB) is created via Ansible.
+  # Lookup/create policies resolve pending_user at planning time and initialize
+  # empty prompt_data. This write is deliberately empty: it establishes no
+  # authenticated session. Login happens only at order 80 after credentials.
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !Find [authentik_flows.flow, [slug, cert-onboarding]]
+      order: 20
+    attrs:
+      stage: !Find [authentik_stages_user_write.userwritestage, [name, cert-onboarding-user-write]]
+      evaluate_on_plan: true
+      re_evaluate_policies: false
+      policy_engine_mode: any
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !Find [authentik_flows.flow, [slug, cert-onboarding]]
+      order: 30
+    attrs:
+      stage: !Find [authentik_stages_prompt.promptstage, [name, cert-onboarding-prompt-password]]
+      evaluate_on_plan: true
+      re_evaluate_policies: false
   - model: authentik_flows.flowstagebinding
     identifiers:
       target: !Find [authentik_flows.flow, [slug, cert-onboarding]]
       order: 40
     attrs:
-      target: !Find [authentik_flows.flow, [slug, cert-onboarding]]
       stage: !Find [authentik_stages_user_write.userwritestage, [name, cert-onboarding-user-write]]
-      order: 40
       evaluate_on_plan: true
+      re_evaluate_policies: false
+
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !Find [authentik_flows.flow, [slug, cert-onboarding]]
+      order: 50
+    attrs:
+      stage: !Find [authentik_stages_prompt.promptstage, [name, cert-onboarding-choose-authenticator]]
+      evaluate_on_plan: false
+      re_evaluate_policies: true
+      policy_engine_mode: all
+
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !Find [authentik_flows.flow, [slug, cert-onboarding]]
+      order: 60
+    attrs:
+      stage: !Find [authentik_stages_authenticator_totp.authenticatortotpstage, [name, cert-onboarding-totp]]
+      evaluate_on_plan: false
+      re_evaluate_policies: true
+      policy_engine_mode: all
+
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !Find [authentik_flows.flow, [slug, cert-onboarding]]
+      order: 70
+    attrs:
+      stage: !Find [authentik_stages_authenticator_webauthn.authenticatorwebauthnstage, [name, cert-onboarding-passkey]]
+      evaluate_on_plan: false
+      re_evaluate_policies: true
+      policy_engine_mode: all
+
+  - model: authentik_flows.flowstagebinding
+    identifiers:
+      target: !Find [authentik_flows.flow, [slug, cert-onboarding]]
+      order: 80
+    attrs:
+      stage: !Find [authentik_stages_user_login.userloginstage, [name, cert-onboarding-user-login]]
+      evaluate_on_plan: false
+      re_evaluate_policies: true
+      policy_engine_mode: all
 
   # ── Notification: local bell on new enrollment ───────────────────
   # When cert-create policy fires ak_create_event("cert_enrollment", ...),

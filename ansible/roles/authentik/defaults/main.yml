@@ -1,0 +1,43 @@
+---
+ansible_python_interpreter: "{{ ansible_playbook_python }}"
+authentik_namespace: authentik
+ingress_namespace: authentik-edge
+acme_ingress_version: "41.7.1"
+cert_manager_version: "v1.20.4"
+nginx_image: "nginx:1.30.4-alpine"
+nginx_replicas: 2
+startup_timeout: 1800
+client_ca_bundle_path: "{{ playbook_dir }}/../../pki/ca-bundle.pem"
+authentik_version: "2026.8.3"
+cnpg_version: "1.24.0"
+enrollment_enabled: true
+
+# Environment supplies the kubeconfig; no implicit use of ~/.kube/config.
+deployment_profile: native
+service_type: NodePort
+external_traffic_policy: Local
+https_node_port: 30443
+http_node_port: 30080
+radius_node_port: 31812
+edge_node_selector: {}
+proxy_protocol_enabled: false
+proxy_protocol_trusted_cidrs: []
+allowed_cidrs_json: '["0.0.0.0/0"]'
+tls_mode: existing_secret
+postgres_mode: cnpg
+postgres_instances: 2
+postgres_storage_size: 10Gi
+postgres_host: "authentik-pg-rw.{{ authentik_namespace }}.svc.cluster.local"
+postgres_port: 5432
+postgres_database: authentik
+postgres_user: authentik
+postgres_sslmode: prefer
+api_forward_port: 19000
+authentik_helm_overrides: {}
+# Optional shared PVC. Multi-node scaling requires RWX or another shared backend.
+media_pvc_enabled: false
+media_access_modes: [ReadWriteMany]
+media_storage_size: 1Gi
+radius_enabled: "{{ deployment_profile == 'native' }}"
+radius_replicas: 1
+radius_client_networks: "127.0.0.1/32"

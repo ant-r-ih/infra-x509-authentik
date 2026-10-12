@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: authentik-radius
+  namespace: {{ authentik_namespace }}
+spec:
+  replicas: {{ radius_replicas }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
+  selector:
+    matchLabels: {app: authentik-radius}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ radius_config_checksum | default('') | to_json }}
+      labels: {app: authentik-radius}
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector: {{ edge_node_selector | to_json }}
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: radius
+          image: ghcr.io/goauthentik/radius:{{ authentik_version }}
+          envFrom:
+            - secretRef: {name: authentik-radius-api}
+          ports:
+            - {name: radius, containerPort: 1812, protocol: UDP}
+            - {name: health, containerPort: 9300}
+          readinessProbe:
+            httpGet: {path: /outpost.goauthentik.io/ping, port: health}
+          livenessProbe:
+            httpGet: {path: /outpost.goauthentik.io/ping, port: health}
+            initialDelaySeconds: 30
+          lifecycle:
+            preStop:
+              exec:
+                command: [/bin/sh, -c, "sleep 10"]
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: authentik-radius
+  namespace: {{ authentik_namespace }}
+spec:
+  type: {{ service_type }}
+{% if service_type != 'ClusterIP' %}
+  externalTrafficPolicy: {{ external_traffic_policy }}
+{% endif %}
+  selector: {app: authentik-radius}
+  ports:
+    - name: radius
+      port: 1812
+      targetPort: radius
+      protocol: UDP
+{% if service_type == 'NodePort' %}
+      nodePort: {{ radius_node_port }}
+{% endif %}

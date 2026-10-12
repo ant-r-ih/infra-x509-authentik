@@ -1,0 +1,25 @@
+---
+# Copy outside this inventory directory and pass explicitly with -i.
+all:
+  children:
+    x509-authentik:
+      hosts:
+        native:
+          ansible_connection: local
+          kubeconfig: /absolute/path/to/dedicated-kubeconfig
+          authentik_domain: auth.example.org
+          storage_class: standard
+          postgres_instances: 1
+          service_type: NodePort
+          external_traffic_policy: Local
+          # All receiving nodes need local ready endpoints when using Local.
+          edge_node_selector: {}
+          radius_client_networks: "192.0.2.0/24"  # replace with your RADIUS clients
+          # Provision authentik-edge/authentik-web-tls before deployment.
+          tls_mode: existing_secret
+          # Optional automatic issuance/renewal via Let's Encrypt:
+          # tls_mode: acme
+          # acme_email: admin@example.org
+          # acme_server: https://acme-staging-v02.api.letsencrypt.org/directory
+          client_ca_bundle_path: /absolute/path/to/client-ca.pem
+          # Supply application secrets separately with -e @secrets.yml (or Vault).

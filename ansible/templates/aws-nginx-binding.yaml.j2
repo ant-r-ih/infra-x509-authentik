@@ -1,0 +1,15 @@
+apiVersion: elbv2.k8s.aws/v1beta1
+kind: TargetGroupBinding
+metadata:
+  name: authentik-edge
+  namespace: {{ ingress_namespace }}
+spec:
+  serviceRef: {name: authentik-edge, port: 443}
+  targetGroupARN: {{ nlb_target_group_arn | to_json }}
+  targetType: ip
+  networking:
+    ingress:
+      - from:
+          - ipBlock: {cidr: {{ vpc_cidr | to_json }}}
+        ports:
+          - {protocol: TCP, port: 8443}

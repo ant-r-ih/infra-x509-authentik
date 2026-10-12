@@ -1,0 +1,23 @@
+/* BEGIN managed certificate enrollment label */
+/* Authentik 2026.8: enrollment copy is fixed in IdentificationStage.
+   Scope the display override to our certificate enrollment link only. */
+.pf-c-login__main-footer-band-item:has(> a[data-ouia-component-id="enroll"][href*="/if/flow/cert-onboarding/"]) {
+    font-size: 0;
+    visibility: hidden;
+}
+.pf-c-login__main-footer-band-item:has(> a[data-ouia-component-id="enroll"][href*="/if/flow/cert-onboarding/"])::before {
+    content: "クライアント証明書をお持ちですか？";
+    display: block;
+    font-size: 1rem;
+    visibility: visible;
+}
+a[data-ouia-component-id="enroll"][href*="/if/flow/cert-onboarding/"] {
+    font-size: 0;
+    visibility: visible;
+}
+a[data-ouia-component-id="enroll"][href*="/if/flow/cert-onboarding/"]::after {
+    content: "こちらからアクセスしてください。";
+    font-size: 1rem;
+    visibility: visible;
+}
+/* END managed certificate enrollment label */

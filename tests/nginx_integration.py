@@ -63,7 +63,8 @@ def write_pair(path, stem, pair):
 def main():
     env = jinja2.Environment(loader=jinja2.FileSystemLoader(ROOT / 'ansible/templates'), undefined=jinja2.StrictUndefined)
     env.filters.update(to_json=json.dumps, from_json=json.loads)
-    values = dict(authentik_domain='auth.example.org', authentik_namespace='authentik',
+    values = dict(proxy_protocol_enabled=True, proxy_protocol_trusted_cidrs=['0.0.0.0/0'],
+                  authentik_domain='auth.example.org', authentik_namespace='authentik',
                   ingress_namespace='authentik-edge', vpc_cidr='0.0.0.0/0',
                   allowed_cidrs_json='["198.51.100.0/24"]', nginx_replicas=2,
                   nginx_image='nginx:1.30.4-alpine', nlb_target_group_arn='arn:test',
@@ -107,14 +108,14 @@ def main():
                 '-v', str(ROOT / 'kubernetes/nginx') + ':/opt/edge:ro',
                 '--entrypoint', '/bin/sh', values['nginx_image'], '/opt/edge/run.sh')
             port = int(run('docker', 'port', name, '8443/tcp').rsplit(':', 1)[1])
-            def request(ctx, source='198.51.100.42'):
+            def request(ctx, source='198.51.100.42', path='/if/flow/cert-onboarding/'):
                 with socket.create_connection(('127.0.0.1', port), timeout=5) as raw:
                     # NLB PROXY protocol v2 IPv4/TCP header precedes the TLS handshake.
                     address = ipaddress.ip_address(source).packed + socket.inet_aton('192.0.2.1') + struct.pack('!HH', 23456, 443)
                     raw.sendall(b'\r\n\r\n\x00\r\nQUIT\n' + bytes([0x21, 0x11]) + struct.pack('!H', len(address)) + address)
                     with ctx.wrap_socket(raw, server_hostname='auth.example.org') as stream:
                         cert = x509.load_der_x509_certificate(stream.getpeercert(binary_form=True))
-                        stream.sendall(b'GET / HTTP/1.1\r\nHost: auth.example.org\r\nX-Amzn-Mtls-Clientcert-Leaf: forged\r\nConnection: close\r\n\r\n')
+                        stream.sendall(b'GET ' + path.encode() + b' HTTP/1.1\r\nHost: auth.example.org\r\nX-Amzn-Mtls-Clientcert-Leaf: forged\r\nConnection: close\r\n\r\n')
                         chunks = []
                         while True:
                             chunk = stream.recv(65536)
@@ -135,13 +136,21 @@ def main():
             assert b'200 OK' in response.split(b'\r\n', 1)[0], response
             assert unquote(response.split(b'\r\n\r\n', 1)[1].decode()) == client[1].public_bytes(serialization.Encoding.PEM).decode()
             print('PASS: trusted client accepted; spoofed identity header overwritten')
-            for ctx, label in [(context, 'no certificate'), (untrusted, 'untrusted CA')]:
+            for ctx, label in [(untrusted, 'untrusted CA')]:
                 try:
                     response, _ = request(ctx)
                     assert b'200 OK' not in response.split(b'\r\n', 1)[0]
                 except ssl.SSLError:
                     pass
                 print('PASS: rejected ' + label)
+            for path in ['/', '/if/flow/default-authentication-flow/', '/api/v3/core/users/me/',
+                         '/if/flow/cert-onboarding/', '/api/v3/flows/executor/cert-onboarding/']:
+                response, _ = request(context, path=path)
+                assert b'200 OK' in response.split(b'\r\n', 1)[0], response
+                assert response.split(b'\r\n\r\n', 1)[1] == b'', response
+                response, _ = request(authenticated, path=path)
+                assert b'200 OK' in response.split(b'\r\n', 1)[0], response
+            print('PASS: optional client certificates on all HTTPS routes; forged identity stripped')
             response, _ = request(authenticated, '203.0.113.1')
             assert b'403 Forbidden' in response.split(b'\r\n', 1)[0], response
             print('PASS: CIDR enforced on PROXY-protocol client address')

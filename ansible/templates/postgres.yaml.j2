@@ -4,9 +4,9 @@ apiVersion: postgresql.cnpg.io/v1
 kind: Cluster
 metadata:
   name: authentik-pg
-  namespace: authentik
+  namespace: {{ authentik_namespace }}
 spec:
-  instances: 2
+  instances: {{ postgres_instances }}
   imageName: ghcr.io/cloudnative-pg/postgresql:16
 
   postgresql:
@@ -16,14 +16,14 @@ spec:
 
   bootstrap:
     initdb:
-      database: authentik
-      owner: authentik
+      database: {{ postgres_database | to_json }}
+      owner: {{ postgres_user | to_json }}
       secret:
         name: authentik-pg-credentials
 
   storage:
-    size: 10Gi
-    storageClass: gp3
+    size: {{ postgres_storage_size }}
+    storageClass: {{ storage_class | to_json }}
 
   resources:
     requests:

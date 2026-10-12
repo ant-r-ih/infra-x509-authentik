@@ -1,0 +1,33 @@
+---
+- name: Read default brand for certificate login wording
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/core/brands/?default=true"
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+    status_code: [200]
+  register: login_brand
+  changed_when: false
+
+- name: Require one default brand
+  assert:
+    that:
+      - login_brand.json.pagination.count == 1
+
+- name: Preserve unrelated brand CSS and replace managed certificate label
+  set_fact:
+    login_brand_css: >-
+      {{ (login_brand.json.results[0].branding_custom_css | default('', true)
+          | regex_replace('(?s)/\* BEGIN managed certificate enrollment label \*/.*?/\* END managed certificate enrollment label \*/', '') | trim)
+          ~ lookup('file', role_path ~ '/files/certificate-login.css') }}
+
+- name: Apply certificate login wording to the default brand
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/core/brands/{{ login_brand.json.results[0].brand_uuid }}/"
+    method: PATCH
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+    body_format: json
+    body:
+      branding_custom_css: "{{ login_brand_css }}"
+    status_code: [200]
+  when: login_brand.json.results[0].branding_custom_css != login_brand_css
