@@ -27,6 +27,14 @@
   when: radius_enabled | bool
   no_log: true
 
+- name: Require native RADIUS for the SSH demo device
+  assert:
+    that:
+      - radius_enabled | bool
+      - deployment_profile != 'aws_nlb' or nlb_ssh_target_group_arn | default('') | length > 0
+    fail_msg: "ssh_demo_enabled needs radius_enabled (and, on AWS, Terraform ssh_demo_enabled)."
+  when: ssh_demo_enabled | bool
+
 - name: Validate ACME inputs
   tags: [acme-http]
   assert:
@@ -330,6 +338,10 @@
       file:
         path: "{{ api_forward_pid.path }}"
         state: absent
+
+- name: Deploy SSH demo device
+  include_tasks: ssh-demo.yml
+  when: ssh_demo_enabled | bool
 
 - name: Print next steps
   debug:

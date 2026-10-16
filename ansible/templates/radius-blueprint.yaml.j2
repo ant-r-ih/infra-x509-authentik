@@ -1,6 +1,6 @@
 # Authentik Blueprint: RADIUS Outpost + Provider
 #
-# RADIUS auth: username (member number) + password
+# RADIUS auth: username (member number) or email + password
 # Authentik RADIUS outpost listens on UDP 1812
 #
 # The RADIUS outpost runs as a separate Deployment in the cluster,
@@ -30,8 +30,10 @@ entries:
       name: radius-identification
     attrs:
       name: radius-identification
+      # Email addresses are assumed unique, as for the default login.
       user_fields:
         - username
+        - email
       pretend_user_exists: true
 
   # Password stage
@@ -111,6 +113,22 @@ entries:
       name: RADIUS
       slug: radius
       provider: !Find [authentik_providers_radius.radiusprovider, [name, radius-provider]]
+
+  # Only radius-users may authenticate; certificate enrollment adds new users.
+  - model: authentik_core.group
+    identifiers:
+      name: radius-users
+    attrs:
+      name: radius-users
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !Find [authentik_core.application, [slug, radius]]
+      order: 0
+    attrs:
+      target: !Find [authentik_core.application, [slug, radius]]
+      group: !Find [authentik_core.group, [name, radius-users]]
+      order: 0
 {% endif %}
 
   # RADIUS Outpost

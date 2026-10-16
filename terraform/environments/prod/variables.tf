@@ -21,7 +21,29 @@ variable "vpc_cidr" {
 variable "allowed_cidrs" {
   type        = list(string)
   default     = ["0.0.0.0/0"]
-  description = "Client CIDRs enforced by nginx for HTTPS (RADIUS access is configured separately)"
+  description = "Client CIDRs enforced by nginx for HTTPS and, for the SSH demo, by the VPC NACL (RADIUS access is configured separately)"
+
+  validation {
+    condition     = length(var.allowed_cidrs) <= 70
+    error_message = "At most 70 CIDRs fit within the SSH demo NACL rule numbers 10-89."
+  }
+}
+
+variable "ebs_reclaim_policy" {
+  type        = string
+  default     = "Retain"
+  description = "gp3 StorageClass reclaim policy: Retain keeps EBS volumes after PVC deletion (production), Delete removes them (demo)"
+
+  validation {
+    condition     = contains(["Retain", "Delete"], var.ebs_reclaim_policy)
+    error_message = "ebs_reclaim_policy must be Retain or Delete."
+  }
+}
+
+variable "ssh_demo_enabled" {
+  type        = bool
+  default     = false
+  description = "Expose the RADIUS-authenticated SSH demo device on NLB TCP 22"
 }
 
 variable "api_allowed_cidrs" {

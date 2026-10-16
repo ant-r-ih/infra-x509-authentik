@@ -69,3 +69,8 @@ output "authentik_api_token" {
 output "authentik_domain" {
   value = var.authentik_domain
 }
+
+output "radius_shared_secret" {
+  value     = random_password.radius_shared_secret.result
+  sensitive = true
+}

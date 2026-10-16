@@ -13,3 +13,7 @@ output "private_subnet_ids" {
 output "eks_nodes_sg_id" {
   value = aws_security_group.eks_nodes.id
 }
+
+output "default_network_acl_id" {
+  value = aws_vpc.main.default_network_acl_id
+}

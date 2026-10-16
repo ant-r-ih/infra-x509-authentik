@@ -29,9 +29,11 @@ spec:
     requests:
       memory: "256Mi"
       cpu: "100m"
+    # Authentik's policy-binding lookups join many tables; a low CPU limit
+    # throttles them into ~30 s API writes on small nodes.
     limits:
       memory: "512Mi"
-      cpu: "500m"
+      cpu: {{ postgres_cpu_limit | to_json }}
 
   monitoring:
     enablePodMonitor: false

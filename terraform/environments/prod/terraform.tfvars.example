@@ -4,7 +4,12 @@ aws_profile = "infra-prod" # production infrastructure account
 cluster_name = "x509-authentik"
 vpc_cidr     = "10.0.0.0/16"
 # HTTPS clients allowed by nginx; HTTP01 validation remains public.
+# With ssh_demo_enabled, the VPC NACL also limits TCP 22 to these CIDRs.
 allowed_cidrs = ["0.0.0.0/0"]
+# Retain keeps PostgreSQL EBS volumes after PVC deletion; use Delete for demos.
+ebs_reclaim_policy = "Retain"
+# RADIUS-authenticated SSH demo device on NLB TCP 22.
+ssh_demo_enabled = false
 # EKS API access for operators; restrict to your management network.
 api_allowed_cidrs = ["0.0.0.0/0"]
 

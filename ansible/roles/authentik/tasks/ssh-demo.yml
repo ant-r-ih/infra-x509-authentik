@@ -1,0 +1,81 @@
+---
+# Demo SSH "device" whose password login is checked by the native RADIUS outpost.
+- name: Read existing SSH demo host key
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: ssh-demo
+    namespace: "{{ authentik_namespace }}"
+  register: ssh_demo_secret
+  no_log: true
+
+# Keep the host key across deployments so clients' known_hosts stay valid.
+- name: Generate SSH demo host key
+  when: ssh_demo_secret.resources | length == 0
+  block:
+    - name: Allocate host key directory
+      tempfile:
+        state: directory
+        prefix: ssh-demo-
+      register: ssh_demo_keydir
+    - name: Create ed25519 host key
+      command: >-
+        ssh-keygen -q -t ed25519 -N '' -C {{ ssh_demo_hostname | quote }}
+        -f {{ (ssh_demo_keydir.path + '/key') | quote }}
+    - name: Read generated host key
+      slurp:
+        src: "{{ ssh_demo_keydir.path }}/key"
+      register: ssh_demo_new_key
+      no_log: true
+  always:
+    - name: Remove host key directory
+      file:
+        path: "{{ ssh_demo_keydir.path }}"
+        state: absent
+      when: ssh_demo_keydir.path is defined
+
+- name: Provision SSH demo secret
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: ssh-demo
+        namespace: "{{ authentik_namespace }}"
+      data:
+        host_key: "{{ ssh_demo_new_key.content if ssh_demo_new_key.content is defined else ssh_demo_secret.resources[0].data.host_key }}"
+        radius_secret: "{{ radius_shared_secret | b64encode }}"
+  no_log: true
+
+- name: Provision SSH demo code
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: ssh-demo-code
+        namespace: "{{ authentik_namespace }}"
+      data:
+        server.py: "{{ lookup('file', playbook_dir + '/../../kubernetes/ssh-demo/server.py') }}"
+        radius_client.py: "{{ lookup('file', playbook_dir + '/../../kubernetes/ssh-demo/radius_client.py') }}"
+
+- name: Compute SSH demo revision
+  set_fact:
+    ssh_demo_checksum: >-
+      {{ (lookup('file', playbook_dir + '/../../kubernetes/ssh-demo/server.py')
+          + lookup('file', playbook_dir + '/../../kubernetes/ssh-demo/radius_client.py')
+          + radius_shared_secret) | hash('sha256') }}
+  no_log: true
+
+- name: Deploy SSH demo device and its Service
+  kubernetes.core.k8s:
+    state: present
+    definition: "{{ lookup('template', playbook_dir + '/../templates/ssh-demo.yaml.j2') | from_yaml_all | list }}"
+
+- name: Wait for SSH demo rollout
+  command: >
+    kubectl rollout status deployment/ssh-demo
+    --timeout={{ startup_timeout }}s -n {{ authentik_namespace }}
+  changed_when: false

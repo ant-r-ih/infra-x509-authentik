@@ -147,8 +147,10 @@ entries:
                 "attributes": {"enrollment_source": "x509"},
             },
         )
-        group, _ = Group.objects.get_or_create(name="cert-users")
-        user.ak_groups.add(group)
+        # radius-users grants RADIUS access (bound in the RADIUS blueprint).
+        for group_name in ("cert-users", "radius-users"):
+            group, _ = Group.objects.get_or_create(name=group_name)
+            user.ak_groups.add(group)
 
         if created:
             # Audit event — visible to admins in Events → Audit Log

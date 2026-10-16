@@ -6,6 +6,11 @@ tls_mode: acme
 kubeconfig: "{{ lookup('env', 'HOME') }}/.kube/x509-authentik-eks"
 service_type: ClusterIP
 storage_class: gp3
+# Terraform's ebs_reclaim_policy overrides this (host variable).
+ebs_reclaim_policy: Retain
 proxy_protocol_enabled: true
 proxy_protocol_trusted_cidrs: ["{{ vpc_cidr }}"]
 radius_client_networks: "0.0.0.0/0"
+# Native RADIUS uses the Terraform-generated radius_shared_secret.
+radius_enabled: true
+ssh_demo_enabled: "{{ nlb_ssh_target_group_arn | default('') | length > 0 }}"

@@ -361,3 +361,25 @@
       is_superuser: false
     status_code: [201]
   when: cert_users_group.json.pagination.count == 0
+
+# Username and email identify users to RADIUS; users must not change them.
+- name: Read user self-service settings
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/admin/settings/"
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+  register: user_change_settings
+  changed_when: false
+
+- name: Disallow users changing their username or email
+  uri:
+    url: "{{ authentik_api_base }}/api/v3/admin/settings/"
+    method: PATCH
+    headers:
+      Authorization: "Bearer {{ authentik_api_token }}"
+    body_format: json
+    body:
+      default_user_change_username: false
+      default_user_change_email: false
+    status_code: [200]
+  when: user_change_settings.json.default_user_change_username or user_change_settings.json.default_user_change_email

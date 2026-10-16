@@ -1,0 +1,122 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ssh-demo
+  namespace: {{ authentik_namespace }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: ssh-demo}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ ssh_demo_checksum | default('') | to_json }}
+      labels: {app: ssh-demo}
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector: {{ edge_node_selector | to_json }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      initContainers:
+        - name: install
+          image: {{ ssh_demo_image | to_json }}
+          command: [pip, install, --no-cache-dir, --disable-pip-version-check, --target, /deps,
+                    {{ ('asyncssh==' + ssh_demo_asyncssh_version) | to_json }}]
+          env:
+            - {name: HOME, value: /tmp}
+          securityContext: &restricted
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: deps, mountPath: /deps}
+            - {name: tmp, mountPath: /tmp}
+      containers:
+        - name: ssh
+          image: {{ ssh_demo_image | to_json }}
+          command: [python, /app/server.py]
+          env:
+            - {name: PYTHONPATH, value: /deps}
+            - {name: PYTHONUNBUFFERED, value: "1"}
+            - {name: DEVICE_HOSTNAME, value: {{ ssh_demo_hostname | to_json }}}
+            - {name: RADIUS_HOST, value: {{ ('authentik-radius.' + authentik_namespace + '.svc.cluster.local') | to_json }}}
+            - {name: RADIUS_PORT, value: "1812"}
+            - {name: SSH_PORT, value: "2222"}
+            - {name: HOST_KEY, value: /etc/ssh-demo/ssh_host_ed25519_key}
+            - name: RADIUS_SECRET
+              valueFrom:
+                secretKeyRef: {name: ssh-demo, key: radius_secret}
+          ports:
+            - {name: ssh, containerPort: 2222}
+          readinessProbe:
+            tcpSocket: {port: ssh}
+          livenessProbe:
+            tcpSocket: {port: ssh}
+            initialDelaySeconds: 15
+          securityContext: *restricted
+          resources:
+            requests: {cpu: 20m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+          volumeMounts:
+            - {name: app, mountPath: /app, readOnly: true}
+            - {name: deps, mountPath: /deps, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+            - name: host-key
+              mountPath: /etc/ssh-demo
+              readOnly: true
+      volumes:
+        - name: app
+          configMap: {name: ssh-demo-code}
+        - name: deps
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        - name: host-key
+          secret:
+            secretName: ssh-demo
+            defaultMode: 0400
+            items:
+              - {key: host_key, path: ssh_host_ed25519_key}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ssh-demo
+  namespace: {{ authentik_namespace }}
+spec:
+  type: {{ service_type }}
+{% if service_type != 'ClusterIP' %}
+  externalTrafficPolicy: {{ external_traffic_policy }}
+{% endif %}
+  selector: {app: ssh-demo}
+  ports:
+    - name: ssh
+      port: 22
+      targetPort: ssh
+      protocol: TCP
+{% if service_type == 'NodePort' %}
+      nodePort: {{ ssh_node_port }}
+{% endif %}
+{% if deployment_profile == 'aws_nlb' %}
+---
+# NACL rules in Terraform restrict public TCP 22 to allowed_cidrs.
+apiVersion: elbv2.k8s.aws/v1beta1
+kind: TargetGroupBinding
+metadata:
+  name: ssh-demo
+  namespace: {{ authentik_namespace }}
+spec:
+  serviceRef: {name: ssh-demo, port: 22}
+  targetGroupARN: {{ nlb_ssh_target_group_arn | to_json }}
+  targetType: ip
+  networking:
+    ingress:
+      - from:
+          - ipBlock: {cidr: {{ vpc_cidr | to_json }}}
+        ports:
+          - {protocol: TCP, port: 2222}
+{% endif %}

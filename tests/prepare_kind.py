@@ -35,6 +35,7 @@ if not (root / 'vars.json').exists():
         authentik_bootstrap_password=secrets.token_hex(24),
         authentik_bootstrap_email='admin@kind.test', authentik_api_token=secrets.token_hex(32),
         radius_shared_secret=secrets.token_hex(24), radius_client_networks='0.0.0.0/0',
+        ssh_demo_enabled=True,
     )
     (root / 'vars.json').write_text(json.dumps(config, indent=2)+'\n')
 (root / 'inventory.yml').write_text('all:\n  children:\n    x509-authentik:\n      hosts:\n        kind-local:\n          ansible_connection: local\n')

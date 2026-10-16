@@ -25,8 +25,9 @@ proxy_protocol_trusted_cidrs: []
 allowed_cidrs_json: '["0.0.0.0/0"]'
 tls_mode: existing_secret
 postgres_mode: cnpg
-postgres_instances: 2
+postgres_instances: 1
 postgres_storage_size: 10Gi
+postgres_cpu_limit: "2"
 postgres_host: "authentik-pg-rw.{{ authentik_namespace }}.svc.cluster.local"
 postgres_port: 5432
 postgres_database: authentik
@@ -41,3 +42,9 @@ media_storage_size: 1Gi
 radius_enabled: "{{ deployment_profile == 'native' }}"
 radius_replicas: 1
 radius_client_networks: "127.0.0.1/32"
+# Demo SSH device authenticating logins via RADIUS; requires radius_enabled.
+ssh_demo_enabled: false
+ssh_demo_hostname: edge-sw01
+ssh_demo_image: "python:3.13-slim"
+ssh_demo_asyncssh_version: "2.24.1"
+ssh_node_port: 30022

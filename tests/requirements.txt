@@ -2,3 +2,4 @@ cryptography>=42
 Jinja2>=3.1
 PyYAML>=6
 requests
+asyncssh

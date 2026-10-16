@@ -138,6 +138,27 @@ Access logs include `mtls=SUCCESS`, `NONE`, or a verification failure. Certifica
 onboarding also requires fresh flow planning; the deployment disables flow and
 policy caches to prevent reuse of another request's certificate decision.
 
+### Demo: SSH device login after certificate enrollment
+
+With `ssh_demo_enabled` (set by `prepare_kind.py`), Ansible deploys `ssh-demo`, a
+simulated network device. Its SSH password login is checked by Access-Request
+to the native RADIUS Service, as a real RADIUS client device would. After login
+it offers only a small device-style CLI (`show users`, `show aaa servers`, `?`,
+`exit`), never a shell; forwarding and SFTP are not offered. Three failures
+disconnect the session. The kind node publishes it on localhost TCP 2222.
+
+After enrolling in the browser and setting a password:
+
+```sh
+ssh -p 2222 -o PubkeyAuthentication=no 1001@127.0.0.1
+```
+
+Enter the password set during onboarding. A kind cluster created before this
+port mapping must be recreated to publish 2222. An existing state directory's
+`vars.json` predates the setting; add `"ssh_demo_enabled": true` to it.
+The host key is generated once and kept in the `ssh-demo` Secret. The Pod
+installs a pinned asyncssh from PyPI at startup, so it needs egress to PyPI.
+
 ### Deploy the same application elsewhere
 
 Copy `ansible/native-inventory.example.yml` outside the auto-loaded inventory
@@ -158,6 +179,13 @@ and, when native RADIUS is enabled, `radius_shared_secret` (at least 16 characte
 outpost token, Deployment and Service. Existing managed outposts must be detached
 from their service connection before selecting this native deployment.
 Blueprints containing the RADIUS secret are mounted from a Kubernetes Secret.
+RADIUS authentication is limited to members of the `radius-users` group, bound
+to the RADIUS application by the blueprint. Certificate enrollment adds newly
+created users to it (with `cert-users`); returning logins do not re-add removed
+members. Grant or revoke RADIUS access for other users in the Authentik admin
+interface by editing that group. RADIUS accepts either the username or the email
+address. Email addresses are assumed unique, as for the default login;
+Ansible keeps users from changing their own username or email.
 
 The principal configuration inputs are:
 
@@ -169,7 +197,7 @@ The principal configuration inputs are:
 | `edge_node_selector` | Place nginx, HTTP controller and RADIUS on nodes receiving external traffic |
 | `proxy_protocol_enabled`, `proxy_protocol_trusted_cidrs` | Optional PROXY protocol, only from explicitly trusted proxies; disabled by default |
 | `allowed_cidrs_json` | HTTPS client CIDRs, encoded as a JSON list |
-| `storage_class`, `postgres_instances`, `postgres_storage_size` | CNPG storage and instance count; class must already exist |
+| `storage_class`, `postgres_instances`, `postgres_storage_size` | CNPG storage and instance count (default 1; use `external`, e.g. RDS, for redundancy); class must already exist |
 | `postgres_mode` | `cnpg` (default) or `external` |
 | `tls_mode` | `existing_secret` (default) or `acme` |
 | `media_pvc_enabled`, `media_storage_class`, `media_access_modes` | Optional persistent `/data` volume shared by server and worker |
@@ -318,6 +346,29 @@ its `aws_profile` setting. Do not switch accounts by applying an existing state
 with a different profile. If using separate checkouts/backends for each account,
 ensure the inventory's `project_path` refers to that account's Terraform project.
 
+## SSH demo device on AWS
+
+Set `ssh_demo_enabled = true` in `terraform.tfvars` and apply. Terraform adds an
+NLB TCP 22 listener forwarding to the `ssh-demo` Pods on 2222, and rules in the
+VPC default network ACL allowing TCP 22 only from `vpc_cidr` and `allowed_cidrs`
+(the NLB has no security group). Then rerun the playbook; the Terraform inventory
+enables the demo when its target group exists. Connect on the standard port
+(kind uses 2222) with the username (certificate CN number) or the email address:
+
+```sh
+ssh -o PubkeyAuthentication=no 1234@auth.example.org
+ssh -o PubkeyAuthentication=no -l alice@example.org auth.example.org
+```
+
+`PubkeyAuthentication=no` avoids local keys counting toward the three allowed
+failures. A rebuilt environment has a new host key; remove the old entry with
+`ssh-keygen -R <authentik_domain>`.
+
+The AWS inventory now deploys the native RADIUS outpost (`radius_enabled: true`)
+with a Terraform-generated `radius_shared_secret`
+(`terraform -chdir=terraform/environments/prod output -raw radius_shared_secret`).
+The NLB UDP 1812 listener is not yet bound to that Service.
+
 ## HTTP01 validation and DNS
 
 The DNS operator only needs to point `authentik_domain` at `nlb_dns_name`
@@ -385,6 +436,34 @@ completed. Without a certificate, the normal login page must remain available,
 but certificate onboarding must not authenticate the user. An untrusted supplied
 certificate must be rejected. Check `kubectl get pods -n authentik-edge` and
 target group health.
+
+## EBS volumes and tearing down
+
+The gp3 StorageClass `reclaimPolicy` comes from Terraform `ebs_reclaim_policy`.
+The default `Retain` keeps PostgreSQL EBS volumes after their PVCs are deleted,
+for production. Set `ebs_reclaim_policy = "Delete"` for demos so volumes are
+removed with their PVCs. A StorageClass's reclaim policy cannot be changed in
+place; the playbook stops if the existing class differs. Existing volumes keep
+the policy they were created with.
+
+Volumes are reclaimed only while the cluster and its EBS CSI driver still run.
+Delete the application before destroying the infrastructure:
+
+```sh
+export KUBECONFIG="$HOME/.kube/x509-authentik-eks"
+kubectl delete targetgroupbindings -A --all
+kubectl delete namespace authentik authentik-edge
+kubectl get pv   # with Delete, wait until the PostgreSQL volumes are gone
+source .env
+terraform -chdir=terraform/environments/prod destroy
+```
+
+Deleting the TargetGroupBindings first lets the AWS Load Balancer Controller
+remove its security group rules. If destroy waits on a subnet or the node
+security group, look for leftover `aws-K8S-*` network interfaces in state
+`available` left by the VPC CNI and delete them. Volumes with `Retain` (or those
+left by destroying the cluster first) remain in EC2 and must be deleted there.
+A new apply creates a new NLB name; repoint the DNS CNAME.
 
 ## Updating an existing NLB deployment
 

@@ -4,7 +4,8 @@ metadata:
   name: gp3
 provisioner: ebs.csi.aws.com
 volumeBindingMode: WaitForFirstConsumer
-reclaimPolicy: Retain
+# Retain keeps EBS volumes after PVC deletion (production); Delete removes them (demo).
+reclaimPolicy: {{ ebs_reclaim_policy }}
 parameters:
   type: gp3
   encrypted: "true"

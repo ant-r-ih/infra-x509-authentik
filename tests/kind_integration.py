@@ -3,18 +3,20 @@
 Uses only the throwaway cluster and credentials from prepare_kind.py.
 """
 import argparse
+import asyncio
 import json
-import hashlib
-import hmac
-import os
-import struct
 from pathlib import Path
 import socket
 import subprocess
+import sys
 import threading
 import time
 
+import asyncssh
 import requests
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'kubernetes/ssh-demo'))
+from radius_client import access_request  # noqa: E402
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--state', type=Path, default=Path('/tmp/authentik-kind'))
@@ -105,7 +107,7 @@ def complete_onboarding(browser):
             data = {'onboarding_authenticator': 'skip'}
         assert browser.get(base + '/api/v3/core/users/me/', timeout=15).status_code in (401, 403)
         r = browser.post(base + '/api/v3/flows/executor/cert-onboarding/',
-            headers={'X-CSRFToken': browser.cookies['authentik_csrf'], 'Referer': base + '/'},
+            headers={'X-CSRFToken': browser.cookies.get('authentik_csrf', ''), 'Referer': base + '/'},
             json={'component': 'ak-stage-prompt', **data}, timeout=15)
         r.raise_for_status()
 
@@ -132,36 +134,33 @@ r = admin.post(base + f"/api/v3/core/users/{user['pk']}/set_password/",
                json={'password': config['authentik_bootstrap_password']}, timeout=15)
 assert r.status_code == 204, (r.status_code, r.text)
 
-def radius_request(password):
-    secret = config['radius_shared_secret'].encode()
-    authenticator = os.urandom(16)
-    identifier = os.urandom(1)[0]
-    padded = password.encode()
-    padded += bytes((-len(padded)) % 16 or (16 if not padded else 0))
-    encrypted = b''
-    previous = authenticator
-    for offset in range(0, len(padded), 16):
-        digest = hashlib.md5(secret + previous).digest()
-        previous = bytes(a ^ b for a, b in zip(padded[offset:offset+16], digest))
-        encrypted += previous
-    attrs = bytes([1, 6]) + b'1001' + bytes([2, 2+len(encrypted)]) + encrypted
-    attrs += bytes([80, 18]) + bytes(16)  # Message-Authenticator (RFC 2869)
-    header = struct.pack('!BBH', 1, identifier, 20+len(attrs)) + authenticator
-    packet = header + attrs
-    packet = packet[:-16] + hmac.new(secret, packet, hashlib.md5).digest()
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
-        udp.settimeout(15)
-        udp.sendto(packet, ('127.0.0.1', 1812))
-        response, _ = udp.recvfrom(4096)
-    assert response[1] == identifier
-    assert len(response) == struct.unpack('!H', response[2:4])[0]
-    expected = hashlib.md5(response[:4] + authenticator + response[20:] + secret).digest()
-    assert hmac.compare_digest(response[4:20], expected), 'Invalid RADIUS response authenticator'
-    return response[0]
+def radius_request(password, username='1001'):
+    code, _ = access_request('127.0.0.1', 1812, config['radius_shared_secret'], username, password)
+    return code
 
 assert radius_request(config['authentik_bootstrap_password']) == 2, 'Expected Access-Accept'
 assert radius_request('incorrect-kind-password') == 3, 'Expected Access-Reject'
 print('PASS: published UDP 1812 accepts valid credentials and rejects invalid credentials')
+assert radius_request(config['authentik_bootstrap_password'], 'akadmin') == 3, 'akadmin is not in radius-users'
+print('PASS: RADIUS rejects valid credentials of users outside radius-users')
+r = admin.patch(base + f"/api/v3/core/users/{user['pk']}/", json={'email': 'user1001@kind.test'}, timeout=15)
+assert r.status_code == 200, (r.status_code, r.text)
+assert radius_request(config['authentik_bootstrap_password'], 'user1001@kind.test') == 2, 'Expected email Access-Accept'
+print('PASS: RADIUS accepts the email address as the login identifier')
+
+if config.get('ssh_demo_enabled'):
+    async def ssh_login(password):
+        async with asyncssh.connect('127.0.0.1', 2222, username='1001', password=password,
+                                    known_hosts=None, client_keys=None, agent_path=None) as conn:
+            return (await conn.run('show users', check=True)).stdout
+
+    assert '1001' in asyncio.run(ssh_login(config['authentik_bootstrap_password']))
+    try:
+        asyncio.run(ssh_login('incorrect-kind-password'))
+        raise AssertionError('SSH demo accepted an invalid password')
+    except asyncssh.PermissionDenied:
+        pass
+    print('PASS: SSH demo device on localhost:2222 authenticates the certificate-enrolled user via RADIUS')
 
 # Marker on shared storage must remain visible to server and worker after replacement.
 subprocess.run(kube + ['exec', '-n', 'authentik', 'deployment/authentik-server', '--',

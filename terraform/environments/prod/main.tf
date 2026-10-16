@@ -193,6 +193,11 @@ resource "random_password" "authentik_api_token" {
   special = false
 }
 
+resource "random_password" "radius_shared_secret" {
+  length  = 32
+  special = false
+}
+
 resource "ansible_host" "deploy" {
   name   = "deploy.x509-authentik"
   groups = ["x509-authentik"]
@@ -206,10 +211,12 @@ resource "ansible_host" "deploy" {
 
     nlb_target_group_arn      = aws_lb_target_group.nginx_https.arn
     nlb_http_target_group_arn = aws_lb_target_group.acme_http.arn
+    nlb_ssh_target_group_arn  = var.ssh_demo_enabled ? aws_lb_target_group.ssh_demo[0].arn : ""
     nlb_dns_name              = aws_lb.radius.dns_name
     acme_email                = var.acme_email
     acme_server               = var.acme_server
     vpc_cidr                  = var.vpc_cidr
+    ebs_reclaim_policy        = var.ebs_reclaim_policy
     allowed_cidrs_json        = jsonencode(var.allowed_cidrs)
     albc_role_arn             = aws_iam_role.albc.arn
     vpc_id                    = module.vpc.vpc_id
@@ -219,6 +226,7 @@ resource "ansible_host" "deploy" {
     authentik_bootstrap_password = var.authentik_bootstrap_password
     authentik_bootstrap_email    = var.authentik_bootstrap_email
     authentik_api_token          = random_password.authentik_api_token.result
+    radius_shared_secret         = random_password.radius_shared_secret.result
   }
 }
 
@@ -247,4 +255,63 @@ resource "aws_lb_listener" "acme_http" {
     type             = "forward"
     target_group_arn = aws_lb_target_group.acme_http.arn
   }
+}
+
+# Optional SSH demo device (logins checked via RADIUS). Public TCP 22 forwards
+# to the Pod's port 2222; the NACL rules below restrict it to allowed_cidrs.
+resource "aws_lb_target_group" "ssh_demo" {
+  count                = var.ssh_demo_enabled ? 1 : 0
+  name_prefix          = "ssh-"
+  port                 = 2222
+  protocol             = "TCP"
+  vpc_id               = module.vpc.vpc_id
+  target_type          = "ip"
+  preserve_client_ip   = false
+  deregistration_delay = 30
+  health_check {
+    protocol = "TCP"
+    port     = "traffic-port"
+  }
+  lifecycle { create_before_destroy = true }
+}
+
+resource "aws_lb_listener" "ssh_demo" {
+  count             = var.ssh_demo_enabled ? 1 : 0
+  load_balancer_arn = aws_lb.radius.arn
+  port              = 22
+  protocol          = "TCP"
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.ssh_demo[0].arn
+  }
+}
+
+# The NLB has no security group; all subnets use the VPC default NACL, whose
+# allow-all rule 100 is evaluated after these lower-numbered rules.
+locals {
+  ssh_allowed_cidrs = var.ssh_demo_enabled ? concat([var.vpc_cidr], var.allowed_cidrs) : []
+}
+
+resource "aws_network_acl_rule" "ssh_allow" {
+  count          = length(local.ssh_allowed_cidrs)
+  network_acl_id = module.vpc.default_network_acl_id
+  rule_number    = 10 + count.index
+  egress         = false
+  protocol       = "tcp"
+  rule_action    = "allow"
+  cidr_block     = local.ssh_allowed_cidrs[count.index]
+  from_port      = 22
+  to_port        = 22
+}
+
+resource "aws_network_acl_rule" "ssh_deny" {
+  count          = var.ssh_demo_enabled ? 1 : 0
+  network_acl_id = module.vpc.default_network_acl_id
+  rule_number    = 90
+  egress         = false
+  protocol       = "tcp"
+  rule_action    = "deny"
+  cidr_block     = "0.0.0.0/0"
+  from_port      = 22
+  to_port        = 22
 }

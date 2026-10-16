@@ -43,8 +43,8 @@ class PolicyTests(unittest.TestCase):
         def create(username, defaults):
             if username in self.users:
                 return self.users[username], False
-            user = types.SimpleNamespace(username=username, **defaults,
-                                         ak_groups=types.SimpleNamespace(add=lambda group: None))
+            user = types.SimpleNamespace(username=username, **defaults, groups=[])
+            user.ak_groups = types.SimpleNamespace(add=user.groups.append)
             self.users[username] = user
             return user, True
         manager = types.SimpleNamespace(
@@ -52,7 +52,7 @@ class PolicyTests(unittest.TestCase):
             get_or_create=create)
         models = types.ModuleType('authentik.core.models')
         models.User = types.SimpleNamespace(objects=manager)
-        models.Group = types.SimpleNamespace(objects=types.SimpleNamespace(get_or_create=lambda **kw: (object(), True)))
+        models.Group = types.SimpleNamespace(objects=types.SimpleNamespace(get_or_create=lambda name: (name, True)))
         self.models = models
         self.plan = types.SimpleNamespace(context={})
 
@@ -99,6 +99,7 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(user.password, '!')
         self.assertTrue(self.plan.context['cert_verified'])
         self.assertEqual(self.plan.context['prompt_data'], {})
+        self.assertEqual(user.groups, ['cert-users', 'radius-users'])
 
     def test_lookup_does_not_create_unknown_user(self):
         self.assertFalse(self.run_policy('lookup', certificate('1234 Alice Example 01')))

@@ -23,10 +23,29 @@
     --kubeconfig {{ kubeconfig | quote }}
 
 # ── StorageClass ────────────────────────────────────────────────
+- name: Read existing gp3 StorageClass
+  kubernetes.core.k8s_info:
+    api_version: storage.k8s.io/v1
+    kind: StorageClass
+    name: gp3
+  register: gp3_storage_class
+
+# reclaimPolicy is immutable; replacing the class is left to the operator.
+- name: Require the existing gp3 StorageClass to match ebs_reclaim_policy
+  assert:
+    that:
+      - ebs_reclaim_policy in ['Retain', 'Delete']
+      - gp3_storage_class.resources | length == 0 or
+        gp3_storage_class.resources[0].reclaimPolicy == ebs_reclaim_policy
+    fail_msg: >-
+      StorageClass gp3 has reclaimPolicy
+      {{ gp3_storage_class.resources[0].reclaimPolicy | default('') }},
+      not {{ ebs_reclaim_policy }}. It cannot be changed in place; see SETUP.md.
+
 - name: Apply gp3 StorageClass
   kubernetes.core.k8s:
     state: present
-    src: "{{ playbook_dir }}/../../kubernetes/cnpg/storageclass.yaml"
+    definition: "{{ lookup('template', playbook_dir + '/../templates/storageclass.yaml.j2') | from_yaml }}"
 
 # ── AWS Load Balancer Controller ────────────────────────────────
 # Terraform outputs are injected via cloud.terraform.terraform_provider inventory.

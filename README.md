@@ -38,6 +38,7 @@ be supplied externally. Redis is not used.
 | `ansible/templates/` | nginx configuration, Kubernetes resources, certificate issuer |
 | `kubernetes/authentik/blueprints/` | Certificate onboarding and credential flows |
 | `kubernetes/nginx/run.sh` | Graceful reload on certificate/CA/config rotation |
+| `kubernetes/ssh-demo/` | Optional simulated SSH device whose logins are checked via RADIUS |
 | `tests/` | Template/policy tests, Docker nginx tests, and full kind integration checks |
 
 See [SETUP.md](SETUP.md) for deployment and operation.
@@ -49,9 +50,41 @@ supplied certificate and replaces client-supplied identity headers. Without a
 certificate, users can use ordinary username/password or registered Passkey login. Certificate-based
 onboarding requires verified identity in the request processed by its policy;
 nginx does not carry that identity between browser connections. RADIUS password
-authentication uses its own Service.
+authentication uses its own Service; an optional SSH demo device uses it
+to authenticate logins.
 TLS 1.2 and TLS 1.3 are enabled.
 
 Certificate onboarding requires password setup before login for users without a
 password. It then offers optional Passkey or TOTP registration, including a skip
 choice. Passkey is selected by default. Existing passwords are preserved.
+
+## SSH demo: certificate enrollment to RADIUS login
+
+A demo deployment can show the whole path from certificate sign-up to a network
+device login:
+
+```text
+Browser with client certificate → /if/flow/cert-onboarding/
+  → user created (CN number as username, emailAddress as email), password set
+  → user joins cert-users and radius-users
+
+ssh <username or email>@<device>
+  → ssh-demo (simulated device, RADIUS client)
+  → Access-Request to the Authentik RADIUS outpost
+  → Access-Accept only for radius-users members → device-style CLI
+```
+
+`ssh-demo` is a small asyncssh server: password logins are checked by RADIUS
+PAP, and authenticated users get only a simulated CLI (`show users`,
+`show aaa servers`, `?`, `exit`), never a shell. It is disabled by default
+(`ssh_demo_enabled`). On kind it listens on localhost TCP 2222:
+
+```sh
+ssh -p 2222 -o PubkeyAuthentication=no 1234@127.0.0.1
+ssh -p 2222 -o PubkeyAuthentication=no -l alice@example.org 127.0.0.1
+```
+
+On AWS, set Terraform `ssh_demo_enabled = true` to publish it on NLB TCP 22
+(`ssh -o PubkeyAuthentication=no -l alice@example.org auth.example.org`),
+limited to `allowed_cidrs` by the VPC network ACL. See [SETUP.md](SETUP.md) for
+both environments.
