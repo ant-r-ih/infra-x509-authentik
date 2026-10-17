@@ -32,6 +32,7 @@ be supplied externally. Redis is not used.
 |---|---|
 | `terraform/` | VPC, EKS, shared NLB, IAM for AWS controllers |
 | `ansible/playbooks/deploy.yml` | Common Kubernetes application deployment, using an explicit kubeconfig |
+| `ansible/playbooks/teardown.yml` | Removes the EKS application before `terraform destroy` (called by its destroy hook) |
 | `ansible/inventory/group_vars/x509-authentik.yml` | AWS/NLB defaults for the Terraform inventory; uses the same `deploy.yml` |
 | `ansible/roles/authentik/` | Shared deployment defaults and tasks |
 | `kubernetes/kind/` | Single-node local verification, with TCP/UDP port mappings |

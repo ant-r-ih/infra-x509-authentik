@@ -29,6 +29,9 @@ module "eks" {
   min_nodes           = var.min_nodes
   max_nodes           = var.max_nodes
   tags                = local.common_tags
+
+  # Destroy the nodes before cleaning up their leftover CNI interfaces.
+  depends_on = [terraform_data.cni_eni_cleanup]
 }
 
 # IRSA role for AWS Load Balancer Controller

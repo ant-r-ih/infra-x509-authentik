@@ -447,23 +447,32 @@ place; the playbook stops if the existing class differs. Existing volumes keep
 the policy they were created with.
 
 Volumes are reclaimed only while the cluster and its EBS CSI driver still run.
-Delete the application before destroying the infrastructure:
+`terraform destroy` handles this with destroy-time hooks
+(`terraform/environments/prod/teardown.tf`):
+
+1. Before the nodes, EBS CSI add-on, controller IAM, target groups and NAT go,
+   it runs `ansible/playbooks/teardown.yml`. The playbook deletes the
+   TargetGroupBindings (the load balancer controller deregisters targets and
+   removes its security group rules), the ClusterIssuer, the application
+   namespaces, waits for Delete-policy volumes, then removes cert-manager,
+   CloudNativePG, the load balancer controller and the gp3 StorageClass. It
+   prints volumes kept by `Retain`.
+2. After the nodes are gone and before the subnets and node security group, it
+   deletes detached `aws-K8S-*` interfaces left by the VPC CNI.
 
 ```sh
-export KUBECONFIG="$HOME/.kube/x509-authentik-eks"
-kubectl delete targetgroupbindings -A --all
-kubectl delete namespace authentik authentik-edge
-kubectl get pv   # with Delete, wait until the PostgreSQL volumes are gone
 source .env
 terraform -chdir=terraform/environments/prod destroy
 ```
 
-Deleting the TargetGroupBindings first lets the AWS Load Balancer Controller
-remove its security group rules. If destroy waits on a subnet or the node
-security group, look for leftover `aws-K8S-*` network interfaces in state
-`available` left by the VPC CNI and delete them. Volumes with `Retain` (or those
-left by destroying the cluster first) remain in EC2 and must be deleted there.
-A new apply creates a new NLB name; repoint the DNS CNAME.
+The hooks need `ansible-playbook`, `kubectl` and the AWS CLI, as for deployment,
+and run only for resources recorded in the state: after upgrading an existing
+deployment, run `terraform apply` once before relying on them. A failing
+teardown stops the destroy; fix the cause and rerun. The playbook can also be
+run alone (`ansible-playbook playbooks/teardown.yml -e aws_profile=<profile>`
+from `ansible/`); it skips Kubernetes cleanup when the cluster or its nodes are
+already gone. Volumes kept by `Retain`, or left by losing the nodes first,
+remain in EC2. A new apply creates a new NLB name; repoint the DNS CNAME.
 
 ## Updating an existing NLB deployment
 

@@ -1,0 +1,144 @@
+---
+# Remove everything deploy.yml created on EKS, in dependency order, so that
+# controllers can release AWS resources (target registrations, security group
+# rules, Delete-policy EBS volumes) before Terraform destroys the cluster.
+# Terraform calls this from a destroy-time hook; it can also be run directly:
+#   ansible-playbook playbooks/teardown.yml -e aws_profile=<profile>
+# Safe to rerun; does nothing if the cluster no longer exists.
+- name: Tear down the Kubernetes application on EKS
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    cluster_name: x509-authentik
+    aws_region: ap-northeast-1
+    app_namespaces: [authentik, authentik-edge]
+    teardown_timeout: 900
+  tasks:
+    - name: Require the AWS profile
+      assert:
+        that: aws_profile is defined and aws_profile | length > 0
+        fail_msg: "Pass -e aws_profile=<profile>."
+
+    - name: Check whether the cluster still exists
+      command: >-
+        aws eks describe-cluster --name {{ cluster_name | quote }}
+        --region {{ aws_region | quote }} --profile {{ aws_profile | quote }}
+        --query cluster.status --output text
+      register: cluster_status
+      changed_when: false
+      failed_when: false
+
+    - name: Skip when the cluster is already gone
+      meta: end_play
+      when: cluster_status.rc != 0
+
+    - name: Allocate a private kubeconfig
+      tempfile:
+        state: file
+        prefix: x509-authentik-teardown-
+      register: teardown_kubeconfig
+
+    - name: Tear down with the private kubeconfig
+      environment:
+        KUBECONFIG: "{{ teardown_kubeconfig.path }}"
+      block:
+        - name: Write kubeconfig for the cluster
+          command: >-
+            aws eks update-kubeconfig --name {{ cluster_name | quote }}
+            --region {{ aws_region | quote }} --profile {{ aws_profile | quote }}
+            --kubeconfig {{ teardown_kubeconfig.path | quote }}
+          changed_when: false
+
+        - name: Check for worker nodes
+          command: kubectl get nodes --no-headers
+          register: nodes
+          changed_when: false
+
+        # Without nodes no controller can run; deletions would hang on finalizers.
+        - name: Skip Kubernetes cleanup without worker nodes
+          debug:
+            msg: "No worker nodes; Kubernetes cleanup skipped. Check EC2 for leftover volumes."
+          when: nodes.stdout | trim | length == 0
+
+        - name: Remove application resources
+          when: nodes.stdout | trim | length > 0
+          block:
+            # The load balancer controller deregisters targets and removes its
+            # security group rules while handling these finalizers.
+            - name: Delete TargetGroupBindings
+              shell: >-
+                if kubectl get crd targetgroupbindings.elbv2.k8s.aws >/dev/null 2>&1; then
+                kubectl delete targetgroupbindings --all -A --wait --timeout={{ teardown_timeout }}s;
+                fi
+              register: tgb_delete
+              changed_when: "'deleted' in tgb_delete.stdout"
+
+            - name: Delete the ACME ClusterIssuer
+              shell: >-
+                if kubectl get crd clusterissuers.cert-manager.io >/dev/null 2>&1; then
+                kubectl delete clusterissuers --all --wait --timeout=120s;
+                fi
+              register: issuer_delete
+              changed_when: "'deleted' in issuer_delete.stdout"
+
+            - name: Record PostgreSQL volumes before deleting their claims
+              command: >-
+                kubectl get pv -o jsonpath='{range .items[?(@.spec.claimRef.namespace=="authentik")]}{.metadata.name} {.spec.csi.volumeHandle} {.spec.persistentVolumeReclaimPolicy}{"\n"}{end}'
+              register: app_volumes
+              changed_when: false
+
+            # Operators (CNPG, cert-manager) must still run to clear finalizers.
+            - name: Delete application namespaces
+              command: >-
+                kubectl delete namespace {{ app_namespaces | join(' ') }}
+                --ignore-not-found --wait --timeout={{ teardown_timeout }}s
+              register: ns_delete
+              changed_when: "'deleted' in ns_delete.stdout"
+
+            - name: Wait for Delete-policy volumes to be removed
+              command: kubectl get pv {{ item.split()[0] }} --ignore-not-found -o name
+              register: pv_left
+              until: pv_left.stdout | length == 0
+              retries: "{{ (teardown_timeout / 10) | int }}"
+              delay: 10
+              changed_when: false
+              loop: "{{ app_volumes.stdout_lines | select('search', ' Delete$') | list }}"
+
+            - name: Remove cert-manager
+              kubernetes.core.helm:
+                kubeconfig: "{{ teardown_kubeconfig.path }}"
+                name: cert-manager
+                release_namespace: cert-manager
+                state: absent
+                wait: true
+
+            - name: Delete operator namespaces (cert-manager, CloudNativePG)
+              command: >-
+                kubectl delete namespace cert-manager cnpg-system
+                --ignore-not-found --wait --timeout={{ teardown_timeout }}s
+              register: operator_ns_delete
+              changed_when: "'deleted' in operator_ns_delete.stdout"
+
+            - name: Remove the AWS Load Balancer Controller
+              kubernetes.core.helm:
+                kubeconfig: "{{ teardown_kubeconfig.path }}"
+                name: aws-load-balancer-controller
+                release_namespace: kube-system
+                state: absent
+                wait: true
+
+            - name: Delete the gp3 StorageClass
+              command: kubectl delete storageclass gp3 --ignore-not-found
+              register: sc_delete
+              changed_when: "'deleted' in sc_delete.stdout"
+
+            - name: Report retained EBS volumes (PV, volume ID, policy)
+              debug:
+                msg: "{{ app_volumes.stdout_lines | select('search', ' Retain$') | list or 'none' }}"
+      always:
+        - name: Remove the private kubeconfig
+          file:
+            path: "{{ teardown_kubeconfig.path }}"
+            state: absent
